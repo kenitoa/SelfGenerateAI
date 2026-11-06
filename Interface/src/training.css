@@ -1,0 +1,11 @@
+.training-step-count { display: flex; justify-content: space-between; font-size: 9px; color: #9faac0; margin-top: 10px; }
+.training-live-metrics { display: flex; gap: 25px; justify-content: center; color: #9aa7bd; font-size: 10px; margin: -8px 0 24px; }
+.training-live-metrics strong { color: #7d8cb1; font-weight: 500; margin-left: 6px; }
+.training-last-update, .training-feedback { color: #9faac0; font-size: 9px; margin-top: 18px; line-height: 1.8; }
+.training-last-update > span { display: block; }
+.training-error { color: #ba7b86; font-size: 10px; margin-top: 14px; line-height: 1.8; overflow-wrap: anywhere; }
+.training-main > .muted { overflow-wrap: anywhere; }
+[data-theme='dark'] :is(.training-step-count, .training-live-metrics, .training-last-update, .training-feedback) { color: var(--dark-muted); }
+[data-theme='dark'] .training-live-metrics strong { color: var(--dark-text); }
+[data-theme='dark'] .training-error { color: #f0a5b1; }
+.training-progress .progress-track > i { transition: none; }

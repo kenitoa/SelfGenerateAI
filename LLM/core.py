@@ -1,0 +1,183 @@
+"""Local durable control storage. Never holds transactions across model work."""
+from __future__ import annotations
+import contextlib
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+import apsw
+
+for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(name, "1")
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+def uid():
+    return str(uuid.uuid4())
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+def digest(value):
+    return hashlib.sha256(value if isinstance(value, bytes) else canonical(value).encode()).hexdigest()
+
+def file_hash(path):
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for part in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(part)
+    return h.hexdigest()
+
+class Fault(Exception):
+    def __init__(self, code, message=None, status=422, details=None):
+        self.code, self.message, self.status, self.details = code, message or code, status, details or {}
+        super().__init__(self.message)
+
+def require(condition, code, message=None, status=422, **details):
+    if not condition:
+        raise Fault(code, message, status, details)
+
+def inside(root, relative):
+    root = Path(root).resolve()
+    target = (root / relative).resolve()
+    require(target.is_relative_to(root) and not Path(relative).is_absolute(), "PATH_OUTSIDE_SCOPE", status=403)
+    return target
+
+def atomic_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp-" + uid())
+    with temp.open("w", encoding="utf-8", newline="\n") as f:
+        f.write(canonical(value)); f.flush(); os.fsync(f.fileno())
+    os.replace(temp, path)
+
+class Store:
+    def __init__(self, root):
+        self.root = Path(root).resolve()
+        for name in ("metadata", "artifacts", "snapshots", "checkpoints", "staging", "backups", "suites", "reports"):
+            (self.root / name).mkdir(parents=True, exist_ok=True)
+        require(tuple(map(int, apsw.sqlitelibversion().split("."))) >= (3,51,3), "SQLITE_PATCH_REQUIRED", status=503)
+        self.lock = threading.RLock()
+        self.db = apsw.Connection(str(self.root / "metadata" / "llm.db"))
+        self.db.set_busy_timeout(5000)
+        self.db.execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")
+        self.db.execute("""
+          CREATE TABLE IF NOT EXISTS records(kind TEXT,id TEXT,body TEXT NOT NULL,PRIMARY KEY(kind,id));
+          CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,type TEXT,state TEXT,payload TEXT,result TEXT,
+            error TEXT,owner TEXT,lease REAL DEFAULT 0,fence INTEGER DEFAULT 0,attempt INTEGER DEFAULT 0,
+            progress TEXT,created TEXT,updated TEXT,request_key TEXT UNIQUE);
+          CREATE TABLE IF NOT EXISTS events(sequence INTEGER PRIMARY KEY AUTOINCREMENT,type TEXT,entity TEXT,data TEXT,at TEXT);
+          CREATE TABLE IF NOT EXISTS consumed(branch TEXT,hash TEXT,example TEXT,run TEXT,at TEXT,PRIMARY KEY(branch,hash));
+          CREATE TABLE IF NOT EXISTS splits(family TEXT,group_id TEXT,split TEXT,PRIMARY KEY(family,group_id));
+          CREATE TABLE IF NOT EXISTS idempotency(key TEXT PRIMARY KEY,request_hash TEXT,result TEXT);
+          CREATE TABLE IF NOT EXISTS migrations(version INTEGER PRIMARY KEY,at TEXT);
+          INSERT OR IGNORE INTO migrations VALUES(1,datetime('now'));
+        """)
+
+    @contextlib.contextmanager
+    def tx(self):
+        with self.lock:
+            nested = not self.db.get_autocommit()
+            name = "sp_" + uuid.uuid4().hex
+            self.db.execute("SAVEPOINT " + name if nested else "BEGIN IMMEDIATE")
+            try:
+                yield
+                self.db.execute("RELEASE " + name if nested else "COMMIT")
+            except BaseException:
+                if nested:
+                    self.db.execute("ROLLBACK TO " + name); self.db.execute("RELEASE " + name)
+                elif not self.db.get_autocommit():
+                    self.db.execute("ROLLBACK")
+                raise
+
+    def rows(self, sql, args=()):
+        with self.lock:
+            cur = self.db.cursor(); cur.execute(sql, args)
+            try: names = [x[0] for x in cur.get_description()]
+            except apsw.ExecutionCompleteError: return []
+            return [dict(zip(names, row)) for row in cur]
+
+    def get(self, kind, identity, default=None):
+        rows = self.rows("SELECT body FROM records WHERE kind=? AND id=?", (kind, identity))
+        if not rows:
+            if default is not None: return default
+            raise Fault("NOT_FOUND", status=404, details={"kind":kind,"id":identity})
+        return json.loads(rows[0]["body"])
+
+    def put(self, kind, body, identity=None, expected=None):
+        identity = identity or body.get("id") or uid()
+        with self.tx():
+            old = self.get(kind, identity, {})
+            if expected is not None: require(old.get("version",0)==expected, "VERSION_CONFLICT", status=412)
+            value = {**old, **body, "id":identity,"version":old.get("version",0)+1,
+                     "createdAt":old.get("createdAt", now()),"updatedAt":now()}
+            self.db.execute("INSERT OR REPLACE INTO records VALUES(?,?,?)", (kind,identity,canonical(value)))
+            return value
+
+    def list(self, kind):
+        return [json.loads(r["body"]) for r in self.rows("SELECT body FROM records WHERE kind=? ORDER BY id",(kind,))]
+
+    def event(self, kind, identity, data=None):
+        with self.tx():
+            self.db.execute("INSERT INTO events(type,entity,data,at) VALUES(?,?,?,?)",(kind,identity,canonical(data or {}),now()))
+
+    def enqueue(self, kind, payload, key=None):
+        with self.tx():
+            if key:
+                rows = self.rows("SELECT id,payload FROM jobs WHERE request_key=?",(key,))
+                if rows:
+                    require(json.loads(rows[0]["payload"]) == payload, "IDEMPOTENCY_CONFLICT",status=409)
+                    return self.job(rows[0]["id"])
+            identity=uid()
+            self.db.execute("INSERT INTO jobs(id,type,state,payload,created,updated,request_key,progress) VALUES(?,?,'queued',?,?,?,?,?)",
+                            (identity,kind,canonical(payload),now(),now(),key,canonical({"stage":"queued","processedItems":0,"totalItems":None,"unit":"items","percent":None})))
+            self.event(kind+".queued",identity)
+            return self.job(identity)
+
+    def job(self, identity):
+        rows=self.rows("SELECT * FROM jobs WHERE id=?",(identity,))
+        require(bool(rows),"JOB_NOT_FOUND",status=404)
+        value=rows[0]
+        for name in ("payload","result","error","progress"):
+            value[name]=json.loads(value[name]) if value[name] else None
+        return {**value,"fencingToken":value["fence"],"updatedAt":value["updated"],**(value.get("progress") or {})}
+
+    def claim(self, owner, kinds=None):
+        with self.tx():
+            rows=self.rows("SELECT id,type FROM jobs WHERE state='queued' OR (state='running' AND lease<?) ORDER BY created",(time.time(),))
+            for row in rows:
+                if kinds and row["type"] not in kinds: continue
+                self.db.execute("UPDATE jobs SET state='running',owner=?,lease=?,fence=fence+1,attempt=attempt+1,updated=? WHERE id=?",(owner,time.time()+60,now(),row["id"]))
+                return self.job(row["id"])
+
+    def assert_lease(self, job):
+        current=self.job(job["id"])
+        require(current["fence"]==job["fence"] and current["owner"]==job["owner"] and current["lease"]>time.time(),"LEASE_EXPIRED",status=409)
+        return current
+
+    def heartbeat(self, job):
+        with self.tx():
+            self.assert_lease(job)
+            self.db.execute("UPDATE jobs SET lease=?,updated=? WHERE id=?",(time.time()+60,now(),job["id"]))
+
+    def progress(self, job, stage, completed=0, total=None, unit="items", **extra):
+        with self.tx():
+            self.assert_lease(job)
+            value={"stage":stage,"processedItems":completed,"totalItems":total,"unit":unit,
+                   "percent":math.floor(completed/total*1000)/10 if total else None,**extra}
+            self.db.execute("UPDATE jobs SET progress=?,updated=? WHERE id=?",(canonical(value),now(),job["id"]))
+
+    def finish(self, job, state, result=None, error=None):
+        with self.tx():
+            self.assert_lease(job)
+            self.db.execute("UPDATE jobs SET state=?,result=?,error=?,updated=? WHERE id=?",(state,canonical(result),canonical(error),now(),job["id"]))
+            self.event(job["type"]+"."+state,job["id"],{"error":error})
+
+    def close(self):
+        with self.lock: self.db.close()

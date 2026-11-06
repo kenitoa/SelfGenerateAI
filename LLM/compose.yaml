@@ -1,0 +1,17 @@
+services:
+  seed:
+    build:
+      context: ..
+      dockerfile: LLM/Dockerfile
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./runtime-data:/data/llm
+      - ../RAG/data:/data/rag
+    restart: unless-stopped
+    mem_limit: ${SEED_MEMORY_LIMIT:-24g}
+    cpus: 1
+    environment:
+      SEED_LLM_DATA_DIR: /data/llm
+      SEED_DATA_DIR: /data/rag
+    # Heavy local training is opt-in after a measured resource check.

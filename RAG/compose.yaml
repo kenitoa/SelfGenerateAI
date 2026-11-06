@@ -1,0 +1,26 @@
+services:
+  seed:
+    build:
+      context: ..
+      dockerfile: RAG/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data/seed
+      # Optional model artifacts only; NAS folder data collection is disabled.
+      # - /volume1/seed-models:/models:ro
+    restart: unless-stopped
+    mem_limit: 1g
+    cpus: 1.0
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    environment:
+      SEED_DATA_DIR: /data/seed
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"

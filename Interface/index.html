@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f7f8fa" />
+    <script>
+      (() => {
+        let theme = 'system';
+        try {
+          const saved = JSON.parse(localStorage.getItem('seed-theme-v1'));
+          if (['light', 'dark', 'system'].includes(saved)) theme = saved;
+        } catch {}
+        const resolved = theme === 'system'
+          ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+          : theme;
+        document.documentElement.dataset.theme = resolved;
+        document.documentElement.style.colorScheme = resolved;
+        document.querySelector('meta[name="theme-color"]').setAttribute('content', resolved === 'dark' ? '#10141d' : '#f7f8fa');
+      })();
+    </script>
+    <meta name="description" content="나만의 AI를 위한 작업, 데이터, 학습 공간" />
+    <title>SEED — Self-evolving AI</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

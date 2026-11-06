@@ -1,0 +1,48 @@
+.nas-catalog { margin-top: 18px; }
+.nas-hardware { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 11px; border: 1px solid #e6eaf4; border-radius: 7px; background: #f7f9fd; }
+.nas-hardware > span { display: flex; align-items: center; gap: 6px; font-size: 10px; color: #8391ae; white-space: nowrap; }
+.nas-hardware > label { display: flex; align-items: center; gap: 6px; font-size: 8px; color: #9ca8bf; }
+.nas-hardware select { max-width: 100px; border: 1px solid #e0e6f2; background: #fff; color: #8491ae; border-radius: 4px; padding: 4px; font-size: 9px; }
+.nas-catalog-caption { display: flex; justify-content: space-between; color: #a0abc1; font-size: 9px; margin: 17px 1px 10px; }
+.nas-catalog-caption > span:last-child { font-size: 8px; }
+.nas-candidates { display: grid; gap: 8px; }
+.nas-candidate { display: flex; align-items: center; gap: 9px; padding: 12px 10px; border: 1px solid #e6eaf4; border-radius: 7px; cursor: pointer; }
+.nas-candidate:hover { background: #f9faff; }
+.nas-candidate.selected { background: #f2f4fd; border-color: #a5b2ea; }
+.nas-candidate.needs-upgrade { background: #fafbfd; cursor: default; }
+.nas-candidate > input { width: 12px; height: 12px; flex-shrink: 0; margin: 0; accent-color: #8594e5; }
+.nas-candidate-body { display: block; flex: 1; min-width: 0; }
+.nas-candidate-title { display: flex; align-items: center; justify-content: space-between; gap: 7px; flex-wrap: wrap; }
+.nas-candidate-title strong { font-size: 10px; font-weight: 500; color: #7685a4; }
+.nas-candidate-title b { font-weight: 600; margin-left: 3px; }
+.nas-tier { padding: 2px 5px; border-radius: 3px; font-size: 7px; white-space: nowrap; background: #f8f1e6; color: #ae9668; }
+.nas-tier.preferred { background: #eaf5ef; color: #77a28d; }
+.nas-candidate-meta { display: block; font-size: 9px; color: #9aa7c1; margin-top: 7px; }
+.nas-candidate-note { display: block; font-size: 8px; color: #a8b3c8; margin-top: 5px; }
+.nas-candidate > svg { color: #8c9bd8; }
+.nas-inference-note { font-size: 9px; color: #9aa8c0; line-height: 1.9; margin-top: 13px; }
+.nas-selection-warning { font-size: 9px; color: #b19a74; line-height: 1.8; margin-top: 11px; }
+.nas-merge-notes { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 12px; }
+.nas-merge-notes summary { display: flex; align-items: center; gap: 6px; list-style: none; cursor: pointer; color: #97a5c1; font-size: 9px; }
+.nas-merge-notes summary::-webkit-details-marker { display: none; }
+.nas-merge-notes summary > svg:last-child { margin-left: auto; }
+.nas-merge-notes[open] summary > svg:last-child { transform: rotate(180deg); }
+.nas-merge-notes > div { color: #9caac3; font-size: 9px; line-height: 1.9; padding-top: 11px; }
+.nas-merge-notes p + p { margin-top: 5px; }
+.nas-merge-notes a { display: inline-flex; align-items: center; gap: 4px; font-size: 8px; margin-top: 9px; margin-right: 12px; }
+.nas-source-links { display: flex; align-items: center; gap: 10px; margin-top: 14px; font-size: 8px; color: #a2adc3; }
+.nas-source-links > a { display: inline-flex; align-items: center; gap: 4px; }
+.nas-source-links > span { margin-left: auto; font-size: 7px; }
+.nas-source-links a:hover, .nas-merge-notes a:hover { color: var(--purple); }
+.model-picker-form > .nas-catalog { margin-top: 0; }
+[data-theme='dark'] .nas-hardware { background: #151b27; border-color: var(--line); }
+[data-theme='dark'] .nas-hardware select { background: #202839; color: var(--dark-secondary); border-color: #354057; }
+[data-theme='dark'] .nas-candidate { border-color: #354057; }
+[data-theme='dark'] .nas-candidate:hover { background: #252e41; }
+[data-theme='dark'] .nas-candidate.selected { background: #2b3656; border-color: #8293e0; }
+[data-theme='dark'] .nas-candidate.needs-upgrade { background: #151b27; }
+[data-theme='dark'] .nas-candidate-title strong { color: var(--dark-text); }
+[data-theme='dark'] :is(.nas-hardware > span, .nas-hardware > label, .nas-catalog-caption, .nas-candidate-meta, .nas-candidate-note, .nas-inference-note, .nas-merge-notes summary, .nas-merge-notes > div, .nas-source-links) { color: var(--dark-muted); }
+[data-theme='dark'] .nas-tier { background: #3b3325; color: #e0c28a; }
+[data-theme='dark'] .nas-tier.preferred { background: #203b34; color: #9bd4bc; }
+[data-theme='dark'] .nas-selection-warning { color: #e0c28a; }
