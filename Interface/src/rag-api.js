@@ -36,7 +36,7 @@ export async function ragRequest(path, { method = 'GET', body, signal, headers =
 }
 
 export async function readSession() { return ragRequest('/auth/me'); }
-export async function login(username, password) { return ragRequest('/auth/login', { method: 'POST', body: { username, password } }); }
+export async function login(password) { return ragRequest('/auth/login', { method: 'POST', body: { password } }); }
 export const items = payload => Array.isArray(payload) ? payload : Array.isArray(payload?.items) ? payload.items : [];
 export function datasetRecord(record) {
   const states = { ready: '준비', needs_review: '검토', processing: '분류', failed: '실패', excluded: '제외', deleted: '제외' };

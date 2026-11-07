@@ -524,6 +524,9 @@ def create_app(data_dir=None, *, start_worker=True, local_dev=False, pre_service
 
     # Last registered middleware is outermost, including pre-auth JSON parsing.
     app.add_middleware(BodyLimitMiddleware)
+    if os.environ.get('SEED_ACCESS_IP'):
+        from docker.access_policy import DirectIPMiddleware
+        app.add_middleware(DirectIPMiddleware, address=os.environ['SEED_ACCESS_IP'])
     dist=Path(__file__).parent.parent/'Interface'/'dist'
     if dist.is_dir():
         app.mount('/',StaticFiles(directory=str(dist),html=True),name='interface')
