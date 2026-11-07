@@ -22,6 +22,30 @@ from RAG.operations import Runtime, system_status, resource_guard
 from RAG.security import Auth
 
 
+def generation_token_limits(settings):
+    """Small-context foundation limits are granted only by a verified file profile."""
+    path_value=settings.get('tokenizerPath')
+    if not isinstance(path_value,str) or not path_value:return {'contextMin':128,'contextMax':131072,'outputMin':128,'outputMax':2048}
+    path=Path(path_value).expanduser()
+    profile_path=path.parent/'generation-profile.json'
+    try:
+        if not profile_path.is_file() or profile_path.stat().st_size>65536:return {'contextMin':128,'contextMax':131072,'outputMin':128,'outputMax':2048}
+        profile=json.loads(profile_path.read_text('utf-8'))
+    except (OSError,ValueError):return {'contextMin':128,'contextMax':131072,'outputMin':128,'outputMax':2048}
+    if not isinstance(profile,dict) or profile.get('templateFormat')!='seed-structured-v1':
+        return {'contextMin':128,'contextMax':131072,'outputMin':128,'outputMax':2048}
+    maximum=profile.get('maxOutputTokens');context=profile.get('contextLength')
+    valid=(profile.get('provider')=='foundation' and profile.get('model')==settings.get('model')
+           and profile.get('releaseId') and profile.get('assemblerVersion')=='seed-roles-v1'
+           and isinstance(maximum,int) and not isinstance(maximum,bool) and 1<=maximum<=128
+           and isinstance(context,int) and not isinstance(context,bool) and 16<=context<=512
+           and path.is_file() and path.stat().st_size<=128*1024**2)
+    if not valid:raise DomainError('GENERATION_PROFILE_INCOMPATIBLE','자체 모델 프로필과 토큰 예산을 확인하세요.',422)
+    if digest(path.read_bytes())!=profile.get('tokenizerSha256') or digest({k:v for k,v in profile.items() if k!='profileHash'})!=profile.get('profileHash'):
+        raise DomainError('TOKENIZER_PROFILE_MISMATCH','자체 모델 프로필 무결성을 확인하세요.',422)
+    return {'contextMin':16,'contextMax':context,'outputMin':1,'outputMax':maximum}
+
+
 class BodyLimitMiddleware:
     def __init__(self, app):
         self.app=app
@@ -222,8 +246,10 @@ def create_app(data_dir=None, *, start_worker=True, local_dev=False, pre_service
         if 'memory' in body and str(body['memory']) not in ('1','2','4','8','16','24','32'):raise DomainError('INVALID_MEMORY','메모리 설정 범위를 확인하세요.',422)
         if 'auto' in body and not isinstance(body['auto'],bool):raise DomainError('INVALID_SETTINGS','auto는 boolean이어야 합니다.',422)
         if 'schedule' in body and (not isinstance(body['schedule'],str) or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',body['schedule'])):raise DomainError('INVALID_SCHEDULE','예약 시각은 HH:MM 형식입니다.',422)
-        for key in ('contextTokens','maxOutputTokens'):
-            if key in body and (not isinstance(body[key],int) or isinstance(body[key],bool) or not 128<=body[key]<=131072):raise DomainError('INVALID_TOKEN_BUDGET','토큰 예산 범위를 확인하세요.',422)
+        if 'contextTokens' in body or 'maxOutputTokens' in body:
+            limits=generation_token_limits({**store.setting('settings',{}),**body})
+            for key,low,high in (('contextTokens',limits['contextMin'],limits['contextMax']),('maxOutputTokens',limits['outputMin'],limits['outputMax'])):
+                if key in body and (not isinstance(body[key],int) or isinstance(body[key],bool) or not low<=body[key]<=high):raise DomainError('INVALID_TOKEN_BUDGET','모델 프로필의 토큰 예산 범위를 확인하세요.',422)
         for key in ('tokenizerPath','model'):
             if key in body and (not isinstance(body[key],str) or len(body[key])>2000):raise DomainError('INVALID_SETTINGS',f'{key} 값을 확인하세요.',422)
         for key in ('allowedSourceHosts','allowedOrigins'):

@@ -13,6 +13,7 @@ class Releases:
 
     def package(self,job):
         body=job['payload'];artifact=self.store.get('artifact',body['artifactId']);root=self.registry.verify(artifact)
+        require(not artifact.get('comparisonOnly'),'COMPARISON_ONLY_MODEL',status=409)
         tools=self.store.get('setting','tools',{})
         converter=Path(tools.get('ggufConverter',''));quantizer=Path(tools.get('quantizer',''))
         require(converter.is_file() and quantizer.is_file(),'QUANTIZATION_TOOLS_UNAVAILABLE',status=503)
@@ -35,7 +36,16 @@ class Releases:
     def prepare(self,body):
         if self.rag:self.rag.refresh_policy()
         artifact=self.store.get('artifact',body['artifactId']);root=self.registry.verify(artifact)
+        require(not artifact.get('comparisonOnly'),'COMPARISON_ONLY_MODEL',status=409)
         certificate=self.store.get('certificate',body['certificateId'])
+        if artifact.get('origin')=='random_init' or artifact.get('foundationProjectId'):
+            require(certificate.get('purpose')=='usable_release' and certificate.get('usable') is True
+                    and not certificate.get('bootstrap') and not certificate.get('baselineOnly')
+                    and certificate.get('approvedModes') and certificate.get('architectureHashV2')==artifact.get('architectureHashV2'),
+                    'FOUNDATION_USABLE_CERTIFICATE_REQUIRED',status=409)
+            release=next((r for r in self.store.list('release') if r.get('artifactId')==artifact['id'] and r.get('certificateId')==certificate['id'] and r.get('profile',{}).get('provider')=='foundation'),None)
+            require(release,'FOUNDATION_RELEASE_PIPELINE_REQUIRED',status=409)
+            return release
         require(certificate['artifactId']==artifact['id'] and certificate['passed'],'RELEASE_NOT_CERTIFIED',status=409)
         require(not artifact.get('fixture'),'FIXTURE_NOT_FOR_PRODUCTION',status=409)
         require((root/'tokenizer.json').is_file(),'TOKENIZER_REQUIRED')
@@ -67,6 +77,14 @@ class Releases:
         require(release['state'] in ('ready','retired','active'),'RELEASE_NOT_READY',status=409)
         self.registry.verify(self.store.get('artifact',release['artifactId']))
         certificate=self.store.get('certificate',release['certificateId']);require(certificate['passed'],'RELEASE_NOT_CERTIFIED',status=409)
+        artifact=self.store.get('artifact',release['artifactId'])
+        require(not artifact.get('comparisonOnly'),'COMPARISON_ONLY_MODEL',status=409)
+        if artifact.get('origin')=='random_init' or artifact.get('foundationProjectId'):
+            require(certificate.get('purpose')=='usable_release' and certificate.get('usable') is True
+                    and not certificate.get('bootstrap') and not certificate.get('baselineOnly')
+                    and certificate.get('profileHash')==release.get('profileHash')
+                    and certificate.get('architectureHashV2')==artifact.get('architectureHashV2')
+                    and certificate.get('approvedModes'),'FOUNDATION_USABLE_CERTIFICATE_REQUIRED',status=409)
         previous=self.store.get('slot','champion',{})
         if expected is not None:require(previous.get('version',0)==expected,'VERSION_CONFLICT',status=412)
         if previous.get('activeReleaseId')==release_id:return previous
@@ -77,6 +95,9 @@ class Releases:
             slot=self.store.put('slot',{'activeReleaseId':release_id,'previousReleaseId':previous.get('activeReleaseId')},'champion',expected=previous.get('version',0))
             if previous.get('activeReleaseId'):self.store.put('release',{'state':'retired'},previous['activeReleaseId'])
             self.store.put('release',{'state':'active','activatedAt':now()},release_id)
+            if self.store.get('foundation_release',release_id,{}):
+                self.store.put('foundation_release',{'state':'active','activatedAt':now()},release_id)
+                self.store.put('foundation_project',{'stage':'usable'},artifact['foundationProjectId'])
             self.store.put('deployment',{'state':'active'},release_id)
         return slot
 

@@ -17,18 +17,25 @@ class Inference:
     @contextmanager
     def foreground(self):
         with self.waiter_lock:self.foreground_waiters+=1
-        self.lock.acquire()
-        with self.waiter_lock:self.foreground_waiters-=1
-        try:yield
-        finally:self.lock.release()
+        try:
+            with self.store.foreground_slot():
+                with self.lock:
+                    with self.waiter_lock:self.foreground_waiters-=1
+                    try:yield
+                    finally:
+                        with self.waiter_lock:self.foreground_waiters+=1
+        finally:
+            with self.waiter_lock:self.foreground_waiters-=1
 
     def expire(self,force=False):
         if not self.lock.acquire(blocking=False):return False
         try:
+            if force:self._template_tokenizer=None
             if self.loaded and (force or time.monotonic()-self.last_used>60):
                 self.model=None;self.tokenizer=None;self.loaded=None
                 import gc
                 gc.collect()
+            if force and hasattr(self,'foundation'):return self.foundation.expire(force=True)
             return True
         finally:self.lock.release()
 
@@ -53,16 +60,31 @@ class Inference:
             available=min(resources['availableRamBytes'],max(0,resources['maxRssBytes']-resources['processRssBytes']))
             estimated=artifact['parameterCount']*4+256*1024**2
             require(available-max(512*1024**2,int(available*.2))>=estimated,'RESOURCE_PRESSURE',status=503)
-            torch.set_num_threads(1)
+            from LLM.foundation.evaluation_restart import child_runtime_threads
+            torch.set_num_threads(child_runtime_threads(self.store))
             self.tokenizer=AutoTokenizer.from_pretrained(directory,local_files_only=True,trust_remote_code=False)
             self.model=AutoModelForCausalLM.from_pretrained(directory,local_files_only=True,trust_remote_code=False,dtype=torch.float32,attn_implementation='eager')
             self.model.eval();self.loaded=artifact_id
         return self.model,self.tokenizer
 
+    def messages_prompt(self,artifact_id,messages):
+        """Use a market baseline's pinned local template, without downloading code."""
+        from transformers import AutoTokenizer
+        artifact=self.store.get('artifact',artifact_id);root=self.registry.verify(artifact)
+        cached=getattr(self,'_template_tokenizer',None)
+        if not cached or cached[0]!=artifact['manifestHash']:
+            cached=(artifact['manifestHash'],AutoTokenizer.from_pretrained(root,local_files_only=True,trust_remote_code=False))
+            self._template_tokenizer=cached
+        require(cached[1].chat_template,'GENERATION_PROFILE_INCOMPATIBLE',status=409)
+        return cached[1].apply_chat_template(messages,tokenize=False,add_generation_prompt=True)
+
     def text(self,artifact_id,prompt,max_tokens=128):
         import torch
         with self.lock:
             artifact=self.store.get('artifact',artifact_id)
+            if artifact.get('origin')=='random_init' or artifact.get('foundationProjectId'):
+                require(hasattr(self,'foundation'),'FOUNDATION_RUNTIME_REQUIRED',status=503)
+                return self.foundation.text(artifact_id,prompt,max_tokens,purpose='evaluation')
             if artifact['format']=='gguf':
                 runtime=self.ollama_register(artifact)
                 started=time.monotonic()
@@ -83,7 +105,7 @@ class Inference:
                 generated=model.generate(**inputs,max_new_tokens=max_tokens,do_sample=False,pad_token_id=tokenizer.eos_token_id)
             result=tokenizer.decode(generated[0,inputs['input_ids'].shape[1]:],skip_special_tokens=True)
             return result,{'prompt_eval_count':int(inputs['input_ids'].shape[1]),'eval_count':int(generated.shape[1]-inputs['input_ids'].shape[1]),
-                'total_duration':int((time.monotonic()-started)*1e9)}
+                'total_duration':int((time.monotonic()-started)*1e9),'cpuThreads':torch.get_num_threads()}
 
     def ollama_register(self,artifact):
         root=self.registry.verify(artifact);runtime=self.store.get('runtime_model',artifact['id'],{})
@@ -107,6 +129,7 @@ class Inference:
         identity=release['artifactId'];options=body.get('options',{})
         maximum=int(options.get('num_predict',700));require(1<=maximum<=8192,'INVALID_TOKEN_BUDGET')
         artifact=self.store.get('artifact',identity)
+        require(not (artifact.get('origin')=='random_init' or artifact.get('foundationProjectId')),'GENERATION_PROFILE_INCOMPATIBLE',status=409)
         if artifact['format']=='gguf':
             runtime=self.ollama_register(artifact)
             with self.foreground(),httpx.stream('POST','http://127.0.0.1:11434/api/generate',json={**body,'model':runtime['alias']},timeout=300) as response:

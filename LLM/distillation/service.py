@@ -5,6 +5,8 @@ class Distiller:
     def run(self,job):
         body=job['payload'];teachers=body.get('teacherArtifactIds',[])
         require(2<=len(teachers)<=3,'DISTILLATION_REQUIRES_TEACHERS')
+        require(all(not self.c.store.get('artifact',teacher).get('comparisonOnly') for teacher in teachers),
+                'COMPARISON_ONLY_MODEL',status=409)
         require(self.c.bridge is not None,'RAG_POLICY_GATEWAY_REQUIRED',status=503)
         branch=self.c.store.get('branch',body['branchId']);accepted=[]
         tasks=body.get('fixtureIds',[]);require(tasks,'INDEPENDENT_FIXTURES_REQUIRED')

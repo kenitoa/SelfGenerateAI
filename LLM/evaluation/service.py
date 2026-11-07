@@ -81,6 +81,7 @@ class Evaluator:
     def bootstrap(self,job):
         import psutil
         artifact=self.store.get('artifact',job['payload']['artifactId'])
+        require(not (artifact.get('origin')=='random_init' or artifact.get('foundationProjectId')),'FOUNDATION_USABLE_CERTIFICATE_REQUIRED',status=409)
         require(artifact['kind']=='base' and not artifact.get('fixture'),'BOOTSTRAP_ONLY_FOR_ANCHOR')
         root=self.registry.verify(artifact)
         config=json.loads((root/'tokenizer_config.json').read_text('utf-8'))

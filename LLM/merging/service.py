@@ -4,6 +4,7 @@ import math
 import shutil
 from pathlib import Path
 from LLM.core import require, digest, atomic_json, uid
+from LLM.foundation.origins import FOUNDATION_ORIGINS
 
 def tensor_map(directory):
     from safetensors import safe_open
@@ -34,12 +35,17 @@ class Merger:
         ids=body.get("artifactIds") or [m["artifactId"] for m in body.get("members",[])]
         require(isinstance(ids,list) and 1<=len(ids)<=3 and len(set(ids))==len(ids),"INVALID_COMBINATION")
         parents=[self.store.get("artifact",i) for i in ids]
+        require(not any(parent.get('comparisonOnly') for parent in parents),'COMPARISON_ONLY_MODEL',status=409)
         weights=body.get("weights") or [m.get("weight",1) for m in body.get("members",[])] or [1]*len(ids)
         require(len(weights)==len(ids) and all(isinstance(w,(float,int)) and not isinstance(w,bool) and math.isfinite(w) and w>0 for w in weights),"INVALID_MERGE_WEIGHTS")
         members=sorted(zip(parents,weights),key=lambda x:x[0]["id"])
         parents=[x[0] for x in members];weights=[x[1]/sum(weights) for x in members]
         family=parents[0]["familyId"]; reasons=[]
         family_record=self.store.get('family',family)
+        anchor=self.store.get('artifact',family_record['anchorArtifactId'])
+        self.registry.verify(anchor)
+        anchor_architecture = self.registry.current_architecture_hash(anchor)
+        parent_architectures = {}
         method=body.get("method","linear_delta")
         require(method in {"linear_delta","task_arithmetic","ties","dare_linear","dare_ties","slerp"},"UNSUPPORTED_MERGE_METHOD")
         if method=="slerp" and len(parents)!=2:reasons.append("SLERP_REQUIRES_TWO_MODELS")
@@ -47,20 +53,29 @@ class Merger:
         if len(ids)>1 and (any(b is None for b in branches) or len(set(branches))!=len(branches) or any(p['kind'] not in ('specialist_checkpoint',) for p in parents)):
             reasons.append("DUPLICATE_BRANCH_OR_NESTED_COMBINATION")
         for p in parents:
+            parent_architectures[p['id']] = self.registry.current_architecture_hash(p)
             if p["familyId"]!=family:reasons.append("INCOMPATIBLE_BASE")
             if p.get('tokenizerHash')!=family_record['tokenizerHash']:reasons.append('INCOMPATIBLE_TOKENIZER')
             if p.get('templateHash')!=family_record['templateHash']:reasons.append('INCOMPATIBLE_TEMPLATE')
-            for key,code in (("tensorSchemaHash","INCOMPATIBLE_TENSOR_SCHEMA"),("tokenizerHash","INCOMPATIBLE_TOKENIZER"),("templateHash","INCOMPATIBLE_TEMPLATE"),("architectureHash","INCOMPATIBLE_ARCHITECTURE")):
+            if parent_architectures[p['id']]!=anchor_architecture:reasons.append('INCOMPATIBLE_ARCHITECTURE')
+            if p.get('tensorSchemaHash')!=anchor.get('tensorSchemaHash'):reasons.append('INCOMPATIBLE_TENSOR_SCHEMA')
+            if anchor.get('origin') in FOUNDATION_ORIGINS or p.get('origin') in FOUNDATION_ORIGINS or anchor.get('foundationProjectId') or p.get('foundationProjectId'):
+                for field in ('origin','foundationProjectId','genesisId','tokenizerId','tokenizerHash','architectureHashV2'):
+                    if p.get(field)!=anchor.get(field):reasons.append('MERGE_FAMILY_INCOMPATIBLE')
+                if p.get('tokenizerAssetsHash')!=anchor.get('tokenizerAssetsHash'):reasons.append('INCOMPATIBLE_TOKENIZER')
+            for key,code in (("tensorSchemaHash","INCOMPATIBLE_TENSOR_SCHEMA"),("tokenizerHash","INCOMPATIBLE_TOKENIZER"),("templateHash","INCOMPATIBLE_TEMPLATE")):
                 if p[key]!=parents[0][key]:reasons.append(code)
             if p.get('format')!='safetensors':reasons.append("MERGE_INPUT_REQUIRES_FLOAT_WEIGHTS")
             self.registry.verify(p)
         scale=body.get("deltaScale",1)
-        require(isinstance(scale,(int,float)) and math.isfinite(scale) and 0<scale<=2,"INVALID_DELTA_SCALE")
+        require(isinstance(scale,(int,float)) and not isinstance(scale,bool) and math.isfinite(scale) and 0<scale<=2,"INVALID_DELTA_SCALE")
         density=body.get("density",.8)
-        require(isinstance(density,(int,float)) and 0<density<=1,"INVALID_DENSITY")
+        require(isinstance(density,(int,float)) and not isinstance(density,bool) and math.isfinite(density) and 0<density<=1,"INVALID_DENSITY")
+        seed=body.get('seed',42)
+        require(isinstance(seed,int) and not isinstance(seed,bool) and 0<=seed<2**32,'INVALID_MERGE_SEED')
         recipe={"familyId":family,"anchorArtifactId":self.store.get("family",family)["anchorArtifactId"],
             "members":[{"artifactId":p['id'],"digest":p['manifestHash'],"coefficient":w} for p,w in zip(parents,weights)],
-            "method":method,"deltaScale":scale,"density":density,"seed":int(body.get("seed",42)),
+            "method":method,"deltaScale":scale,"density":density,"seed":seed,
             "computeDtype":"float32","outputDtype":body.get("outputDtype","float32"),"implementationVersion":1,
             "tokenizerHash":parents[0]["tokenizerHash"],"templateHash":parents[0]["templateHash"]}
         require(recipe['outputDtype'] in ('float32','float16','bfloat16'),"INVALID_OUTPUT_DTYPE")
@@ -92,9 +107,11 @@ class Merger:
         torch.set_num_threads(1)
         combo=self.store.get('combination',job['payload']['combinationId'])
         recipe=combo['recipe']
+        require(digest(recipe)==combo['id']==combo['recipeHash'],'MERGE_RECIPE_HASH_MISMATCH',status=409)
         parents=[self.store.get('artifact',m['artifactId']) for m in recipe['members']]
         fresh=self.preflight({'artifactIds':[p['id'] for p in parents], 'weights':[m['coefficient'] for m in recipe['members']],**{k:recipe[k] for k in ('method','deltaScale','density','seed','outputDtype')}})
         require(fresh['compatible'],"INCOMPATIBLE_COMBINATION",status=409)
+        require(fresh['recipeHash']==combo['recipeHash'],'MERGE_RECIPE_CHANGED',status=409)
         from LLM.workers.resources import observe
         available=observe(self.store.root)['availableRamBytes']
         require(available-max(512*1024**2,int(available*.2))>=fresh['estimatedResources']['peakRamBytes'],'RESOURCE_PRESSURE',status=503)

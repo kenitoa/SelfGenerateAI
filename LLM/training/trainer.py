@@ -10,6 +10,11 @@ DEFAULTS={'rank':8,'loraAlpha':16,'dropout':.05,'epochs':1,'batchSize':1,'gradie
           'targetModules':['q_proj','v_proj'],'device':'cpu','gradientClipping':1.0,'earlyStoppingPatience':2,'minValidationDelta':.0001,'objective':'sft','dpoBeta':.1}
 
 def encode_example(tokenizer, row, maximum):
+    if hasattr(tokenizer,'encode_ordinary') and hasattr(tokenizer,'assemble'):
+        start=tokenizer.assemble([{'role':'user','content':row['instruction']}],assistant_prefix=True)
+        target=[*tokenizer.encode_ordinary(row['output']),7]
+        require(target and len(start)+len(target)<=maximum,'INPUT_TOO_LARGE_FOR_TRAINING')
+        return {'input_ids':start+target,'labels':[-100]*len(start)+target}
     prefix='<|im_start|>user\n'+row['instruction']+'<|im_end|>\n<|im_start|>assistant\n'
     start=tokenizer.encode(prefix,add_special_tokens=False)
     target=tokenizer.encode(row['output']+'<|im_end|>',add_special_tokens=False)
@@ -42,6 +47,7 @@ class Trainer:
         torch.set_num_threads(1)
         body=job['payload'];cfg=self.config(body.get('config',body))
         branch=self.store.get('branch',body['branchId']);anchor=self.store.get('artifact',branch['anchorArtifactId'])
+        require(not anchor.get('comparisonOnly'),'COMPARISON_ONLY_MODEL',status=409)
         root=self.registry.verify(anchor)
         snapshot=self.store.get('snapshot',body['snapshotId'])
         require(snapshot['familyId']==branch['familyId'],'INCOMPATIBLE_BASE')
@@ -49,13 +55,19 @@ class Trainer:
         if prior_run.get('state')=='completed' and prior_run.get('outputArtifactId'):
             self.registry.verify(self.store.get('artifact',prior_run['outputArtifactId']))
             return {'artifactId':prior_run['outputArtifactId'],'adapterArtifactId':prior_run['adapterArtifactId'],'completedSteps':prior_run['completedSteps'],'state':'completed'}
-        tokenizer=AutoTokenizer.from_pretrained(root,local_files_only=True,trust_remote_code=False)
+        foundation=anchor.get('origin')=='random_init' or bool(anchor.get('foundationProjectId'))
+        if foundation:
+            from LLM.foundation.tokenizer import load as load_native
+            tokenizer=load_native(self.store,anchor['tokenizerId'])
+            require(cfg['maxSequence']<=min(512,int(anchor.get('trainedContextTokens',128))),'INPUT_TOO_LARGE_FOR_TRAINING')
+            require(cfg['device']=='cpu' and cfg['objective']=='sft','FOUNDATION_SPECIALIZATION_SFT_REQUIRED')
+        else:tokenizer=AutoTokenizer.from_pretrained(root,local_files_only=True,trust_remote_code=False)
         if prior_run.get('datasetRows'):
             rows=prior_run['datasetRows'];batch_receipt=prior_run['batchReceipt']
         else:rows,batch_receipt=self.snapshots.batch(branch['id'],snapshot['id'],tokenizer,cfg['objective'])
         target_tokens=sum(len(tokenizer.encode(r['output'],add_special_tokens=False)) for r in rows)
         synthetic_tokens=sum(len(tokenizer.encode(r['output'],add_special_tokens=False)) for r in rows if r.get('targetOrigin')=='teacher')
-        require(not target_tokens or synthetic_tokens/target_tokens<=.3,'SYNTHETIC_RATIO_EXCEEDED',status=409)
+        require(not target_tokens or synthetic_tokens/target_tokens<=(0 if foundation else .3),'SYNTHETIC_RATIO_EXCEEDED',status=409)
         prepared=[]; used=[];excluded=[]
         for row in rows:
             try:prepared.append(prepare(tokenizer,row,cfg['maxSequence'],cfg['objective'],encode_example));used.append(row)
@@ -76,7 +88,7 @@ class Trainer:
             checkpoint=self.store.get('checkpoint',resume_id)
             require(checkpoint['runId']==job['id'] and checkpoint['configHash']==digest(cfg) and checkpoint['snapshotHash']==snapshot['manifestHash'],'CHECKPOINT_MISMATCH')
             cp=self.store.root/checkpoint['storagePath']
-            require(file_hash(cp/'optimizer.pt')==checkpoint['optimizerHash'],'CHECKPOINT_HASH_MISMATCH')
+            require(file_hash(cp/('optimizer.json' if foundation else 'optimizer.pt'))==checkpoint['optimizerHash'],'CHECKPOINT_HASH_MISMATCH')
             for name,checksum in checkpoint.get('files',{}).items():require(file_hash(cp/name)==checksum,'CHECKPOINT_HASH_MISMATCH')
             model=PeftModel.from_pretrained(model,cp/'adapter',is_trainable=True,local_files_only=True)
         elif branch.get('currentAdapterId'):
@@ -100,13 +112,17 @@ class Trainer:
         completed=0; cursor=0; loss_value=None
         best_validation=float('inf');bad_epochs=0;validation_history=[];early_stopped=False
         if resume_id:
-            saved=torch.load(cp/'optimizer.pt',map_location=cfg['device'],weights_only=True)
+            if foundation:
+                from LLM.foundation.checkpoint import _unpack
+                from safetensors.torch import load_file
+                saved=_unpack(json.loads((cp/'optimizer.json').read_text('utf-8')),load_file(str(cp/'optimizer.safetensors')))
+            else:saved=torch.load(cp/'optimizer.pt',map_location=cfg['device'],weights_only=True)
             optimizer.load_state_dict(saved['optimizer']);completed=saved['completedSteps'];cursor=saved['cursor']
             torch.set_rng_state(saved['rng'].cpu());random.setstate(saved['pythonRng'])
             if saved.get('cudaRng') and torch.cuda.is_available():torch.cuda.set_rng_state_all(saved['cudaRng'])
             before=saved['initialHash']
             if saved.get('scheduler'):scheduler.load_state_dict(saved['scheduler'])
-            best_validation=saved.get('bestValidation',float('inf'));bad_epochs=saved.get('badEpochs',0)
+            best_validation=saved.get('bestValidation') if saved.get('bestValidation') is not None else float('inf');bad_epochs=saved.get('badEpochs',0)
             validation_history=saved.get('validationHistory',[])
         run=self.store.put('training_run',{'branchId':branch['id'],'snapshotId':snapshot['id'],'snapshotHash':snapshot['manifestHash'],
             'config':cfg,'configHash':digest(cfg),'anchorArtifactId':anchor['id'],'state':'running','completedSteps':completed,
@@ -116,16 +132,22 @@ class Trainer:
         def checkpoint_save(cursor_value):
             identity=uid();dest=self.store.root/'staging'/('checkpoint-'+identity);dest.mkdir()
             model.save_pretrained(dest/'adapter',safe_serialization=True)
-            torch.save({'optimizer':optimizer.state_dict(),'completedSteps':completed,'cursor':cursor_value,'rng':torch.get_rng_state(),
+            optimizer_state={'optimizer':optimizer.state_dict(),'completedSteps':completed,'cursor':cursor_value,'rng':torch.get_rng_state(),
                         'pythonRng':random.getstate(),'cudaRng':torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,'initialHash':before,'scheduler':scheduler.state_dict(),
-                        'bestValidation':best_validation,'badEpochs':bad_epochs,'validationHistory':validation_history},dest/'optimizer.pt')
+                        'bestValidation':best_validation if math.isfinite(best_validation) else None,'badEpochs':bad_epochs,'validationHistory':validation_history}
+            if foundation:
+                from LLM.foundation.checkpoint import _pack
+                from safetensors.torch import save_file
+                tensors={};tree=_pack(optimizer_state,tensors)
+                save_file(tensors,str(dest/'optimizer.safetensors'));atomic_json(dest/'optimizer.json',tree)
+            else:torch.save(optimizer_state,dest/'optimizer.pt')
             import os
             for path in dest.rglob('*'):
                 if path.is_file():
                     with path.open('r+b') as handle:handle.flush();os.fsync(handle.fileno())
             published=self.store.root/'checkpoints'/identity;dest.replace(published);dest=published
             record=self.store.put('checkpoint',{'runId':job['id'],'storagePath':dest.relative_to(self.store.root).as_posix(),
-                'optimizerHash':file_hash(dest/'optimizer.pt'),'configHash':digest(cfg),'snapshotHash':snapshot['manifestHash'],
+                'optimizerHash':file_hash(dest/('optimizer.json' if foundation else 'optimizer.pt')),'configHash':digest(cfg),'snapshotHash':snapshot['manifestHash'],
                 'completedSteps':completed,'cursor':cursor_value,'files':{p.relative_to(dest).as_posix():file_hash(p) for p in dest.rglob('*') if p.is_file()}},identity)
             self.store.put('training_run',{'checkpointId':identity},job['id'])
             return record
@@ -192,7 +214,8 @@ class Trainer:
         adapter=self.registry.publish(adapter_dir,kind='adapter',family_id=anchor['familyId'],parents=adapter_parents,branch_id=branch['id'],license_refs=anchor['licenseRefs'],
             metadata={'trainingRunId':job['id'],'snapshotId':snapshot['id'],'snapshotIds':sorted({r.get('snapshotId',snapshot['id']) for r in used}),'initialTrainableHash':before,'trainedHash':after})
         full=model.merge_and_unload(safe_merge=True)
-        full_dir=self.store.root/'staging'/('specialist-'+uid());full.save_pretrained(full_dir,safe_serialization=True);tokenizer.save_pretrained(full_dir)
+        full_dir=self.store.root/'staging'/('specialist-'+uid());full.save_pretrained(full_dir,safe_serialization=True)
+        if not foundation:tokenizer.save_pretrained(full_dir)
         # Preserve byte-identical family tokenizer assets; HF reserialization may
         # change JSON metadata without changing the learned tokenizer semantics.
         import shutil

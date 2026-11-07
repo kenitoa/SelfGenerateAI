@@ -53,6 +53,12 @@ def create_app(root,*,token=None,local=False,worker=False,allowed_roots=(),contr
     @app.post('/api/training/jobs/{identity}/{action}')
     def command(identity:str,action:str):return control.command(identity,action)
 
+    @app.post('/internal/v1/foundation/generate')
+    async def foundation_generate(request:Request):
+        body=await request.json()
+        await run_in_threadpool(control.foundation.runtime.prepare,body)
+        return StreamingResponse(control.foundation.stream(body),media_type='application/x-ndjson')
+
     @app.post('/internal/v1/workers/register')
     async def register(request:Request):return transport.register(await request.json())
     @app.post('/internal/v1/workers/{identity}/{action}')
@@ -93,11 +99,26 @@ def create_app(root,*,token=None,local=False,worker=False,allowed_roots=(),contr
     @app.api_route('/internal/v1/{path:path}',methods=['GET','POST','PATCH'])
     async def internal(path:str,request:Request):
         body=await request.json() if request.method!='GET' else {}
-        return await run_in_threadpool(dispatch,control,path,request.method,body,request.headers.get('idempotency-key'),request.headers.get('if-match'))
+        result=await run_in_threadpool(dispatch,control,path,request.method,body,request.headers.get('idempotency-key'),request.headers.get('if-match'))
+        return foundation_http_response(path,request.method,result)
     return app
+
+def foundation_http_response(path,method,result):
+    """Apply additive foundation status codes after durable JSON idempotency."""
+    if method!='POST' or not path.startswith('foundation/') or not isinstance(result,dict):return result
+    if str(result.get('type','')).startswith('foundation_') and result.get('state')=='queued':
+        return JSONResponse(result,status_code=202)
+    if path in ('foundation/projects','foundation/suites','foundation/self-code/suites',
+                'foundation/graduations','foundation/release-candidates'):
+        return JSONResponse(result,status_code=201)
+    return result
 
 def dispatch(c,path,method,body,key=None,expected=None):
     from LLM.core import canonical,digest
+    if method!='GET':require(not c.store.get('setting','deploymentMaintenance',{}).get('enabled'),'DEPLOYMENT_MAINTENANCE',status=503)
+    if path=='foundation/generate':
+        require(method=='POST','METHOD_NOT_ALLOWED',status=405)
+        return c.foundation.dispatch('generate',method,body,key,expected)
     commands={'learning/run','learning/pause','learning/resume','combinations/preflight','certifications','adapter-compressions','garbage-collections','deployments/champion/rollback','curation/run','curation/bind','self-code/run','self-code/setup','self-code/rollback','market-baselines'}
     action=path.split('/')[-1]
     if path in commands or action in ('activate','build','cancel','pause','resume','select'):
@@ -123,6 +144,8 @@ def dispatch(c,path,method,body,key=None,expected=None):
     return result
 
 def _dispatch(c,path,method,body,key=None,expected=None):
+    if path=='foundation' or path.startswith('foundation/'):
+        return c.foundation.dispatch(path.removeprefix('foundation').lstrip('/'),method,body,key,expected)
     if method in ('POST','PATCH') and method=='POST':require(key,'IDEMPOTENCY_KEY_REQUIRED')
     if path=='capabilities':return c.capabilities()
     if path=='resource-policy':

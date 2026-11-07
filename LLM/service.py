@@ -19,7 +19,9 @@ from LLM.release import Releases
 from LLM.learning import Scheduler
 
 class Control:
-    def __init__(self,root,allowed_roots=(),worker=False):
+    def __init__(self,root,allowed_roots=(),worker=False,execution_scope='nas'):
+        require(execution_scope in ('nas','pc_validation'),'INVALID_EXECUTION_SCOPE')
+        self.execution_scope=execution_scope
         self.store=Store(root);self.registry=Registry(self.store,allowed_roots)
         self.snapshots=Snapshots(self.store);self.merger=Merger(self.store,self.registry)
         self.trainer=Trainer(self.store,self.registry,self.snapshots);self.inference=Inference(self.store,self.registry)
@@ -32,6 +34,12 @@ class Control:
         from LLM.evolution import SelfEvolution
         self.evolution=SelfEvolution(self)
         self.bridge=None;self.worker_enabled=worker;self.stop_event=threading.Event();self.threads=[];self.active=None;self.owner='local-'+uid()
+        from LLM.foundation.service import FoundationController
+        self.foundation=FoundationController(self)
+        self.registry.on_revoke=self.foundation.revoke_teacher
+        self.inference.foundation=self.foundation.runtime
+        from LLM.foundation.scheduler import FoundationScheduler
+        self.foundation_scheduler=FoundationScheduler(self)
 
     def activation_blockers(self,policy=None):
         blockers=[]
@@ -101,6 +109,7 @@ class Control:
             'reasonCodes':[] if snapshot else ['SNAPSHOT_REQUIRED']}
 
     def has_worker(self,kind):
+        if kind.startswith('foundation_'):return self.foundation.has_worker()
         if self.worker_enabled and all(importlib.util.find_spec(m) for m in ('torch','peft','transformers','safetensors')):return True
         from datetime import datetime,timezone
         return any(kind in w.get('capabilities',[]) and w.get('state')=='online' and
@@ -193,13 +202,17 @@ class Control:
         try:self.store.put('setting',self.releases.reconcile(),'deploymentHealth')
         except Fault as exc:self.store.put('setting',{'state':'needs_review','reasonCodes':[exc.code]},'deploymentHealth')
         if self.worker_enabled:
-            self.store.put('worker',{'capabilities':['train','merge','evaluate','quantize'],'state':'online','observedAt':now()},self.owner)
+            from LLM.foundation.service import JOB_TYPES
+            foundation_only=os.environ.get('SEED_FOUNDATION_WORKER')=='1' or self.execution_scope=='pc_validation'
+            caps=sorted(JOB_TYPES) if foundation_only else ['train','merge','evaluate','quantize']
+            self.store.put('worker',{'capabilities':caps,'state':'online','observedAt':now(),'foundationSharedVolume':foundation_only,
+                'executionScope':self.execution_scope},self.owner)
             t=threading.Thread(target=self._work,daemon=True,name='seed-llm-worker');t.start();self.threads.append(t)
         t=threading.Thread(target=self._supervise,daemon=True,name='seed-llm-supervisor');t.start();self.threads.append(t)
 
     def stop(self):
         self.stop_event.set()
-        for t in self.threads:t.join(timeout=5)
+        for t in self.threads:t.join(timeout=85 if t.name=='seed-llm-worker' and self.active and self.active['type'].startswith('foundation_') else 5)
 
     def step(self):
         if self.inference.foreground_waiters or not self.inference.lock.acquire(blocking=False):return False
@@ -211,7 +224,15 @@ class Control:
         pending=self.store.rows("SELECT id FROM jobs WHERE state='queued' OR (state='running' AND lease<?) LIMIT 1",(time.time(),))
         if not pending:return False
         if not self.inference.expire(force=True):return False
-        job=self.store.claim(self.owner,{'train','merge','evaluate','quantize','distill','bootstrap','compress','curate','evolve'})
+        from LLM.foundation.service import JOB_TYPES
+        from LLM.foundation.resources import isolated_network
+        foundation_only=os.environ.get('SEED_FOUNDATION_WORKER')=='1' or self.execution_scope=='pc_validation'
+        kinds=set(JOB_TYPES) if foundation_only else {'train','merge','evaluate','quantize','distill','bootstrap','compress','curate','evolve'}
+        if not foundation_only:
+            for item in self.store.rows("SELECT payload FROM jobs WHERE type LIKE 'foundation_%' AND state='queued'"):
+                project=self.store.get('foundation_project',json.loads(item['payload']).get('projectId',''),{})
+                if project.get('testOnly'):kinds.update(JOB_TYPES);break
+        job=self.store.claim(self.owner,kinds)
         if not job:return False
         self.active=job
         started=time.monotonic()
@@ -239,7 +260,9 @@ class Control:
                 estimated=anchor['parameterCount']*4+512*1024**2
                 require(available-max(512*1024**2,int(available*.2))>=estimated,'RESOURCE_PRESSURE',status=503)
             if self.bridge:self.bridge.refresh_policy()
-            if job['type']=='train':
+            if job['type'] in JOB_TYPES:
+                result=self.foundation.execute(job)
+            elif job['type']=='train':
                 if self.bridge:self.bridge.validate_snapshot(self.store.get('snapshot',job['payload']['snapshotId']))
                 result=self.trainer.run(job)
             elif job['type']=='merge':result=self.merger.build(job)
@@ -256,9 +279,10 @@ class Control:
             else:
                 from LLM.distillation import Distiller
                 result=Distiller(self).run(job)
-            state='paused' if result.get('state') in ('paused','yielded') else 'completed'
+            state='paused' if result.get('state') in ('paused','yielded') else 'cancelled' if result.get('state')=='cancelled' else 'completed'
             self.store.finish(job,state,result)
-            if result.get('state')=='yielded':self.command(job['id'],'resume')
+            if result.get('state')=='yielded':
+                if job['type'] not in JOB_TYPES:self.command(job['id'],'resume')
         except BaseException as exc:
             if not isinstance(exc,Exception):raise
             code=getattr(exc,'code','JOB_FAILED')
@@ -266,6 +290,9 @@ class Control:
             try:
                 self.store.finish(job,'cancelled' if code=='JOB_CANCELLED' else 'failed',error=error)
                 if job['type']=='train':self.store.put('training_run',{'state':'cancelled' if code=='JOB_CANCELLED' else 'failed','finishedAt':now(),'error':error},job['id'])
+                if job['type'] in JOB_TYPES:
+                    self.store.put('foundation_run',{'state':'cancelled' if code=='JOB_CANCELLED' else 'failed','finishedAt':now(),'error':{'code':code}},job['id'])
+                    self.store.put('foundation_project',{'stage':'held','reasonCodes':[code]},job['payload']['projectId'])
             except Fault:pass
         finally:
             heartbeat_stop.set();lease_thread.join(timeout=1);self.active=None
@@ -282,11 +309,15 @@ class Control:
         while not self.stop_event.wait(5):
             try:
                 if self.active:self.store.heartbeat(self.active)
+                self.store.put('worker',{'state':'online','observedAt':now()},self.owner) if self.worker_enabled else None
                 self.inference.expire()
                 self.scheduler.advance();self.scheduler.check();self.advance_certifications();self.advance_distillations()
                 self.recipe_search.advance()
                 self.evolution.check()
                 self.evolution.advance_feedback()
+                self.foundation.advance_extensions()
+                self.foundation.maintain_storage()
+                self.foundation_scheduler.advance()
                 if self.bridge:
                     from LLM.data.curator import Curator
                     Curator(self.bridge).import_exports()

@@ -14,16 +14,28 @@ def main():
     install=sub.add_parser('install-model');install.add_argument('--repo',default='Qwen/Qwen2.5-Coder-0.5B-Instruct');install.add_argument('--revision',default='main')
     register=sub.add_parser('register');register.add_argument('directory');register.add_argument('--license',required=True);register.add_argument('--name',default='Imported model')
     tools=sub.add_parser('configure-tools');tools.add_argument('--converter',required=True);tools.add_argument('--quantizer',required=True)
+    tools.add_argument('--toolchain-receipt')
     verifier=sub.add_parser('register-verifier');verifier.add_argument('--image',required=True);verifier.add_argument('--language',choices=['python','javascript','typescript','sql'],default='python')
+    verifier.add_argument('--purpose',choices=['code','self_code_regression'],default='code')
     fixture=sub.add_parser('register-fixture');fixture.add_argument('file')
     resources=sub.add_parser('configure-resources');resources.add_argument('--nas-ram-gb',type=int,default=32);resources.add_argument('--reserve-gb',type=int,default=8)
     evolution=sub.add_parser('setup-self-code');evolution.add_argument('--profile-id',required=True)
-    sub.add_parser('backup')
+    backup_parser=sub.add_parser('backup');backup_parser.add_argument('--expires-days',type=int,default=30);backup_parser.add_argument('--key-id')
     gc=sub.add_parser('gc');gc.add_argument('--apply',action='store_true')
     recovery=sub.add_parser('restore');recovery.add_argument('--backup',required=True);recovery.add_argument('--destination',required=True)
+    recovery.add_argument('--key-store');recovery.add_argument('--allow-legacy',action='store_true')
+    candidate=sub.add_parser('pc-candidate');candidate.add_argument('--preparation-root',default='LLM/runtime-data/preparation/official-v1')
+    candidate.add_argument('--max-seconds',type=int,default=14400);candidate.add_argument('--tokens-per-phase',type=int,default=1_000_000)
+    candidate.add_argument('--cpu-threads',type=int);candidate.add_argument('--micro-batch-size',type=int)
+    acceptance=sub.add_parser('pre-nas-check');acceptance.add_argument('--project-id');acceptance.add_argument('--software',action='store_true');acceptance.add_argument('--container',action='store_true')
     sub.add_parser('check')
     args=parser.parse_args();root=Path(args.data_dir).resolve()
     os.environ['SEED_LLM_DATA_DIR']=str(root)
+    if args.command=='pc-candidate':
+        from LLM.foundation.pc_validation import run
+        print(json.dumps(run(args.preparation_root,max_seconds=args.max_seconds,tokens_per_phase=args.tokens_per_phase,
+            cpu_threads=args.cpu_threads,micro_batch_size=args.micro_batch_size),ensure_ascii=False,indent=2))
+        return
     if args.command=='serve':
         require_local=args.host in ('localhost','127.0.0.1','::1')
         if args.local and not require_local:parser.error('--local은 loopback에서만 가능합니다.')
@@ -73,25 +85,36 @@ def main():
         from LLM.core import require,file_hash
         converter=Path(args.converter).resolve();quantizer=Path(args.quantizer).resolve()
         require(converter.is_file() and converter.suffix=='.py' and quantizer.is_file(),'TOOLCHAIN_FILES_REQUIRED')
-        result=c.store.put('setting',{'ggufConverter':str(converter),'converterHash':file_hash(converter),'quantizer':str(quantizer),'quantizerHash':file_hash(quantizer)},'tools')
+        fields={'ggufConverter':str(converter),'converterHash':file_hash(converter),'quantizer':str(quantizer),'quantizerHash':file_hash(quantizer)}
+        if args.toolchain_receipt:
+            receipt=Path(args.toolchain_receipt).resolve();require(receipt.is_file() and not receipt.is_symlink(),'TOOLCHAIN_RECEIPT_REQUIRED')
+            fields.update(toolchainReceipt=str(receipt),toolchainReceiptHash=file_hash(receipt))
+        result=c.store.put('setting',fields,'tools')
         print('Registered pinned conversion tools:',result['id'])
     elif args.command=='register-verifier':
         from LLM.core import require
-        require('@sha256:' in args.image,'PINNED_SANDBOX_IMAGE_REQUIRED')
-        print(c.store.put('verifier_profile',{'language':args.language,'image':args.image})['id'])
+        from LLM.verification.broker import pinned
+        value={'language':args.language,'image':args.image,'purpose':args.purpose}
+        require(pinned(value),'PINNED_SANDBOX_IMAGE_REQUIRED')
+        print(c.store.put('verifier_profile',value)['id'])
     elif args.command=='register-fixture':
         from LLM.core import require
         body=json.loads(Path(args.file).read_text('utf-8'));require(body.get('profileId') and (body.get('tests') or body.get('cases')),'INVALID_VERIFIER_FIXTURE')
         c.store.get('verifier_profile',body['profileId']);print(c.store.put('fixture',body)['id'])
     elif args.command=='backup':
         from LLM.storage import backup
-        print(backup(c.store)['id'])
+        print(backup(c.store,expires_days=args.expires_days,key_id=args.key_id)['id'])
     elif args.command=='gc':
         from LLM.storage.retention import collect
         print(json.dumps(collect(c.store,args.apply),ensure_ascii=False,indent=2))
     elif args.command=='restore':
         from LLM.storage import restore
-        print(json.dumps(restore(args.backup,args.destination),ensure_ascii=False))
+        print(json.dumps(restore(args.backup,args.destination,key_store=args.key_store,allow_legacy=args.allow_legacy),ensure_ascii=False))
+    elif args.command=='pre-nas-check':
+        from LLM.foundation.acceptance import run_software,run_container,assess
+        if args.software:run_software(c)
+        if args.container:run_container(c)
+        print(json.dumps(assess(c,args.project_id),ensure_ascii=False,indent=2))
     else:print(json.dumps(c.capabilities(),ensure_ascii=False,indent=2))
 
 if __name__=='__main__':main()

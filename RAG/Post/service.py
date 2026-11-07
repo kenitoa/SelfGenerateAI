@@ -27,6 +27,27 @@ from RAG.core import DomainError, now, uid
 
 MODES = {"code", "review", "refactor", "test"}
 TERMINAL = {"completed", "failed", "cancelled", "insufficient_evidence"}
+SNAPSHOT_SHARD_BYTES=128*1024**2
+SNAPSHOT_INLINE_EXAMPLES=1000
+
+
+def _file_checksum(path):
+    checksum=hashlib.sha256()
+    with Path(path).open('rb') as handle:
+        while block:=handle.read(1024**2):checksum.update(block)
+    return checksum.hexdigest()
+
+
+def _manifest_examples(directory,manifest):
+    if manifest.get('exampleMetadataFile'):
+        name=manifest['exampleMetadataFile']
+        if Path(name).name!=name or name not in manifest['files'] or _file_checksum(Path(directory)/name)!=manifest['files'][name]:
+            raise DomainError('SNAPSHOT_HASH_MISMATCH','SNAPSHOT_HASH_MISMATCH',409)
+        with (Path(directory)/name).open('rb') as handle:
+            while line:=handle.readline(2*1024**2+1):
+                if len(line)>2*1024**2:raise DomainError('SNAPSHOT_ROW_TOO_LARGE','SNAPSHOT_ROW_TOO_LARGE',413)
+                yield json.loads(line)
+    else:yield from manifest.get('examples',[])
 MODE_GUIDANCE = {
     "code": "요구사항, 구현 코드, 사용 예, 제약을 구분한다.",
     "review": "코드 위치, 문제, 근거, 우선순위, 수정안을 구분한다.",
@@ -415,9 +436,13 @@ class PostService:
         except (OSError, ValueError) as error:
             raise DomainError("TOKENIZER_PROFILE_REQUIRED", "tokenizer.json 옆에 generation-profile.json이 필요합니다.", 503) from error
         required = {"model", "modelRevision", "tokenizerRevision", "tokenizerSha256", "templateFormat", "contextLength"}
-        if not isinstance(profile, dict) or not required.issubset(profile) or profile["templateFormat"] != "chatml" or profile["model"] != cfg.get("model"):
+        if not isinstance(profile, dict) or not required.issubset(profile) or profile["templateFormat"] not in {"chatml","seed-structured-v1"} or profile["model"] != cfg.get("model"):
             raise DomainError("TOKENIZER_PROFILE_MISMATCH", "모델과 일치하는 ChatML tokenizer 프로필이 필요합니다.", 503)
-        if not isinstance(profile["contextLength"], int) or not 512 <= profile["contextLength"] <= 131072 or not str(profile["modelRevision"]).strip() or not str(profile["tokenizerRevision"]).strip():
+        if profile['templateFormat']=='seed-structured-v1' and (profile.get('provider')!='foundation' or not profile.get('releaseId') or not profile.get('profileHash') or profile.get('assemblerVersion')!='seed-roles-v1'):
+            raise DomainError('GENERATION_PROFILE_INCOMPATIBLE','자체 모델의 검증된 structured profile이 필요합니다.',503)
+        minimum_context=16 if profile['templateFormat']=='seed-structured-v1' else 512
+        maximum_context=512 if profile['templateFormat']=='seed-structured-v1' else 131072
+        if isinstance(profile['contextLength'],bool) or not isinstance(profile["contextLength"], int) or not minimum_context <= profile["contextLength"] <= maximum_context or not str(profile["modelRevision"]).strip() or not str(profile["tokenizerRevision"]).strip():
             raise DomainError("TOKENIZER_PROFILE_MISMATCH", "프로필 revision과 컨텍스트 길이를 확인하세요.", 503)
         checksum = hashlib.sha256(path.read_bytes()).hexdigest()
         if checksum != profile["tokenizerSha256"]:
@@ -447,6 +472,10 @@ class PostService:
 
     def _context(self, run, evidence):
         tokenizer = self._tokenizer()
+        if (self.generation_profile or {}).get('templateFormat')=='seed-structured-v1':
+            handler=getattr(self,'foundation_context',None)
+            if handler is None:raise DomainError('GENERATION_PROFILE_INCOMPATIBLE','자체 모델 컨텍스트 어댑터가 연결되지 않았습니다.',503)
+            return handler(run,evidence,self.generation_profile)
         cfg = self._config()
         profile_limit = (self.generation_profile or {}).get("contextLength", 4096)
         context_limit = max(512, min(profile_limit, 32768, int(cfg.get("contextTokens", 4096))))
@@ -618,7 +647,12 @@ class PostService:
                         return
             flush_thread = threading.Thread(target=flush_loop, name="seed-response-flush", daemon=True)
             flush_thread.start()
-            response = connection.open("POST", "/api/generate", {"model": model, "prompt": self._render_chatml(messages), "raw": True, "stream": True, "options": {"num_ctx": context_limit, "num_predict": output_limit, "temperature": 0.2}, "keep_alive": "1m"})
+            if self.generation_profile.get('templateFormat')=='seed-structured-v1':
+                response=connection.open('POST','/internal/v1/foundation/generate',{'model':model,'releaseId':self.generation_profile['releaseId'],
+                    'profileHash':self.generation_profile['profileHash'],'messages':messages,'mode':run['mode'],'stream':True,
+                    'options':{'num_ctx':context_limit,'num_predict':output_limit,'temperature':0.2}})
+            else:
+                response = connection.open("POST", "/api/generate", {"model": model, "prompt": self._render_chatml(messages), "raw": True, "stream": True, "options": {"num_ctx": context_limit, "num_predict": output_limit, "temperature": 0.2}, "keep_alive": "1m"})
             started = time.monotonic()
             text = ""
             usage, done, finish_reason = {}, False, None
@@ -850,12 +884,24 @@ class PostService:
     def create_snapshot(self, body=None):
         body = body or {}
         ids = body.get("exampleIds")
-        examples = self.examples()
+        def candidates():
+            if ids is not None:
+                for identity in ids:yield self.store.get('training_example',identity)
+            else:
+                cursor=''
+                while True:
+                    page=self.store.read("SELECT id,body FROM records WHERE kind='training_example' AND id>? ORDER BY id LIMIT 32",(cursor,))
+                    if not page:break
+                    for row in page:yield json.loads(row['body'])
+                    cursor=page[-1]['id']
         if ids is not None:
             if not isinstance(ids, list) or len(set(ids)) != len(ids):
                 raise DomainError("INVALID_EXAMPLE_IDS", "학습 예시 ID 형식 오류")
-            examples = [self.store.get("training_example", item) for item in ids]
-        selected = [item for item in examples if item.get("reviewStatus") == "approved" and item.get("permissionStatus") == "allowed"]
+        selected=[]
+        for item in candidates():
+            if item.get('reviewStatus')!='approved' or item.get('permissionStatus')!='allowed':continue
+            if self._example_reasons(item):raise DomainError('EXAMPLE_POLICY_CHANGED','EXAMPLE_POLICY_CHANGED',409)
+            selected.append({key:item[key] for key in ('id','lineage','splitGroup') if key in item})
         if not selected:
             raise DomainError("NO_APPROVED_EXAMPLES", "승인된 학습 예시가 없습니다.", 409)
         for example in selected:
@@ -873,23 +919,28 @@ class PostService:
     def snapshot(self, snapshot_id):
         snapshot = self.store.get("training_snapshot", snapshot_id)
         if snapshot.get("status") == "ready":
+            revision=self.store.setting('trainingDataRevision',0);epoch=self.store.setting('policyVersion',0)
+            if getattr(self.pre,'store',None) is self.store and snapshot.get('validatedDataRevision')==revision and snapshot.get('validatedPolicyVersion')==epoch:return snapshot
             for example_id in snapshot.get("exampleIds", []):
                 example = self.store.get("training_example", example_id)
                 if example.get("reviewStatus") != "approved" or self._example_reasons(example):
                     snapshot.update(status="revoked", revokedAt=now(), trainerVerified=False)
                     return self._put("training_snapshot", snapshot)
+            snapshot=self._put('training_snapshot',{**snapshot,'validatedDataRevision':revision,'validatedPolicyVersion':epoch})
         return snapshot
 
     def _export(self, snapshot_id):
         snapshot = self.snapshot(snapshot_id)
         if snapshot.get("status") == "ready":
             return snapshot
-        examples = [self.store.get("training_example", key) for key in snapshot["exampleIds"]]
-        for example in examples:
+        examples=[]
+        for key in snapshot['exampleIds']:
+            example=self.store.get('training_example',key)
             if example.get("reviewStatus") != "approved" or example.get("permissionStatus") != "allowed" or self._example_reasons(example):
                 snapshot["status"] = "revoked"
                 self._put("training_snapshot", snapshot)
                 raise DomainError("EXAMPLE_POLICY_CHANGED", "학습 자료의 검증·권한 상태가 변경되었습니다.", 409)
+            examples.append({field:example[field] for field in ('id','lineage','splitGroup','contentHash') if field in example})
         assigned_groups = self._split_assignments(examples)
         groups = sorted(set(assigned_groups.values()), key=lambda value: _hash(value))
         if len(groups) < 3:
@@ -907,7 +958,7 @@ class PostService:
             if not path_value: continue
             previous_manifest = self.store.root / path_value / 'manifest.json'
             if not previous_manifest.is_file(): continue
-            for item in json.loads(previous_manifest.read_text('utf-8')).get('examples', []):
+            for item in _manifest_examples(previous_manifest.parent,json.loads(previous_manifest.read_text('utf-8'))):
                 group, role = item.get('splitGroup'), item.get('split')
                 if group in ledger and ledger[group] != role:
                     raise DomainError('SPLIT_LEAKAGE', '이전 학습 스냅샷 사이에 계보 분할 충돌이 있습니다.', 409)
@@ -923,6 +974,8 @@ class PostService:
             if len(roles)>1: raise DomainError('SPLIT_LEAKAGE', '연결된 원문 계보가 기존 train/test 경계를 넘습니다.', 409)
             if roles: constrained[group] = next(iter(roles))
         if not ledger:
+            for group in groups:
+                if group in constrained:splits[group]=constrained[group]
             ledger.update(splits)
         else:
             for group in groups:
@@ -945,21 +998,40 @@ class PostService:
         staging = self.store.root / "exports" / (snapshot_id + ".staging")
         staging.mkdir(parents=True, exist_ok=True)
         split_counts, manifest_examples = {"train": 0, "validation": 0, "test": 0}, []
-        handles = {}
+        handles = {};shard_names={split:[split+'.jsonl'] for split in split_counts};shard_sizes={split:0 for split in split_counts}
+        metadata_handle=None
         try:
             for split in split_counts:
                 handles[split] = (staging / f"{split}.jsonl").open("w", encoding="utf-8", newline="\n")
-            for example in examples:
+            metadata_handle=(staging/'examples.jsonl').open('w',encoding='utf-8',newline='\n')
+            for metadata_example in examples:
+                example=self.store.get('training_example',metadata_example['id'])
+                if example['contentHash']!=metadata_example['contentHash'] or example.get('reviewStatus')!='approved' or example.get('permissionStatus')!='allowed':
+                    raise DomainError('EXAMPLE_POLICY_CHANGED','EXAMPLE_POLICY_CHANGED',409)
                 split = splits[assigned_groups[example["id"]]]
                 item = {"instruction": example["input"], "output": example["target"]}
-                handles[split].write(json.dumps(item, ensure_ascii=False, allow_nan=False) + "\n")
+                encoded=json.dumps(item,ensure_ascii=False,allow_nan=False)+'\n';amount=len(encoded.encode())
+                if amount>2*1024**2:raise DomainError('SNAPSHOT_ROW_TOO_LARGE','SNAPSHOT_ROW_TOO_LARGE',413)
+                if shard_sizes[split] and shard_sizes[split]+amount>SNAPSHOT_SHARD_BYTES:
+                    handles[split].flush();os.fsync(handles[split].fileno());handles[split].close()
+                    name=f'{split}-{len(shard_names[split]):05d}.jsonl';shard_names[split].append(name)
+                    handles[split]=(staging/name).open('w',encoding='utf-8',newline='\n');shard_sizes[split]=0
+                handles[split].write(encoded);shard_sizes[split]+=amount
                 split_counts[split] += 1
-                manifest_examples.append({"id": example["id"], "hash": example["contentHash"], "lineage": example["lineage"], "permissionStatus": example["permissionStatus"], "reviewReason": example.get("reviewReason"), "splitGroup": assigned_groups[example["id"]], "split": split})
+                meta={"id": example["id"], "hash": example["contentHash"], "lineage": example["lineage"], "permissionStatus": example["permissionStatus"], "reviewReason": example.get("reviewReason"), "splitGroup": assigned_groups[example["id"]], "split": split}
+                metadata_handle.write(json.dumps(meta,ensure_ascii=False,sort_keys=True)+'\n')
+                if len(examples)<=SNAPSHOT_INLINE_EXAMPLES:manifest_examples.append(meta)
             for handle in handles.values():
                 handle.flush()
                 os.fsync(handle.fileno())
                 handle.close()
-            manifest = {"id": snapshot_id, "createdAt": now(), "schemaVersion": 1, "format": snapshot["format"], "exampleCount": len(examples), "splitCounts": split_counts, "examples": manifest_examples, "validation": {"secretsChecked": True, "lineageChecked": True, "holdoutExcluded": True, "codeExecuted": False}, "files": {f"{split}.jsonl": hashlib.sha256((staging / f"{split}.jsonl").read_bytes()).hexdigest() for split in split_counts}}
+            metadata_handle.flush();os.fsync(metadata_handle.fileno());metadata_handle.close();metadata_handle=None
+            version2=len(examples)>SNAPSHOT_INLINE_EXAMPLES or any(len(names)>1 for names in shard_names.values())
+            files={name:_file_checksum(staging/name) for names in shard_names.values() for name in names}
+            if version2:files['examples.jsonl']=_file_checksum(staging/'examples.jsonl')
+            else:(staging/'examples.jsonl').unlink()
+            manifest = {"id": snapshot_id, "createdAt": now(), "schemaVersion": 2 if version2 else 1, "format": snapshot["format"], "exampleCount": len(examples), "splitCounts": split_counts, "examples": manifest_examples, "validation": {"secretsChecked": True, "lineageChecked": True, "holdoutExcluded": True, "codeExecuted": False}, "files": files}
+            if version2:manifest.update(exampleMetadataFile='examples.jsonl',splitShards=shard_names,maxShardBytes=SNAPSHOT_SHARD_BYTES)
             manifest_raw = json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2).encode()
             with (staging / "manifest.json").open("wb") as handle:
                 handle.write(manifest_raw)
@@ -974,13 +1046,15 @@ class PostService:
                 staging.replace(directory)
             else:
                 expected = (directory / "manifest.json").read_bytes()
-                if json.loads(expected).get("examples") != manifest_examples:
+                if json.loads(expected).get('files')!=manifest['files'] or json.loads(expected).get("examples") != manifest_examples:
                     raise DomainError("SNAPSHOT_IMMUTABLE", "기존 스냅샷은 변경할 수 없습니다.", 409)
                 manifest_raw = expected
-            snapshot.update(status="ready", storagePath=str(directory.relative_to(self.store.root)), manifestHash=hashlib.sha256(manifest_raw).hexdigest(), splitCounts=split_counts, completedAt=now(), trainerVerified=False)
+            snapshot.update(status="ready", storagePath=str(directory.relative_to(self.store.root)), manifestHash=hashlib.sha256(manifest_raw).hexdigest(), splitCounts=split_counts, completedAt=now(), trainerVerified=False,
+                validatedDataRevision=None,validatedPolicyVersion=None)
             self.store.activity("training_snapshot_ready", snapshot_id, "승인 학습 스냅샷 내보내기 완료")
             return self._put("training_snapshot", snapshot)
         finally:
+            if metadata_handle is not None:metadata_handle.close()
             for handle in handles.values():
                 if not handle.closed:
                     handle.close()

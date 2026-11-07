@@ -19,7 +19,7 @@ def observe(root,cgroup_root=Path('/sys/fs/cgroup')):
     memory=psutil.virtual_memory();available=memory.available;scope='host';limit=None
     limit,used=cgroup_memory(cgroup_root)
     if limit is not None:available=min(available,max(0,limit-used));scope='container'
-    return {'availableRamBytes':available,'processRssBytes':psutil.Process().memory_info().rss,
+    return {'availableRamBytes':available,'hostAvailableRamBytes':memory.available,'processRssBytes':psutil.Process().memory_info().rss,
         'freeDiskBytes':shutil.disk_usage(root).free,'memoryLimitBytes':limit,'totalRamBytes':memory.total,'observationScope':scope}
 
 

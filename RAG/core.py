@@ -185,6 +185,8 @@ class Store:
             value = {**previous, **body, "id": identity, "createdAt": previous.get("createdAt", body.get("createdAt", now())), "updatedAt": now()}
             db.execute("INSERT INTO records(kind,id,body,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET body=excluded.body,updated_at=excluded.updated_at",
                        (kind, identity, json.dumps(value, ensure_ascii=False), value["createdAt"], value["updatedAt"]))
+            if kind in ('source','document','version','training_example'):
+                db.execute("INSERT INTO settings(key,value) VALUES('trainingDataRevision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(settings.value AS INTEGER)+1")
             return value
 
     def get(self, kind, id):
@@ -199,6 +201,8 @@ class Store:
     def delete(self, kind, id):
         with self.tx() as db:
             db.execute("DELETE FROM records WHERE kind=? AND id=?", (kind, str(id)))
+            if kind in ('source','document','version','training_example'):
+                db.execute("INSERT INTO settings(key,value) VALUES('trainingDataRevision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(settings.value AS INTEGER)+1")
 
     def setting(self, key, default=None):
         row = self.one("SELECT value FROM settings WHERE key=?", (key,))
@@ -207,6 +211,8 @@ class Store:
     def set_setting(self, key, value):
         with self.tx() as db:
             db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, json.dumps(value, ensure_ascii=False)))
+            if key in ('policyVersion','evaluationHoldout','trainingStableOrigins','trainingStableSplits'):
+                db.execute("INSERT INTO settings(key,value) VALUES('trainingDataRevision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(settings.value AS INTEGER)+1")
 
     def activity(self, type, entity_id, message):
         with self.tx() as db:

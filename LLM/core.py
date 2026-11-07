@@ -12,6 +12,10 @@ import uuid
 from datetime import datetime, timezone
 import apsw
 
+HEAVY_JOBS=frozenset({'train','merge','evaluate','quantize','distill','bootstrap','compress','curate','evolve',
+    'foundation_corpus','foundation_tokenizer','foundation_initialize','foundation_calibrate','foundation_pretrain','foundation_cpt','foundation_sft','foundation_evaluate','foundation_self_code_evaluate',
+    'foundation_distill','foundation_response_distill','foundation_growth','foundation_growth_adopt','foundation_relearn','foundation_format'})
+
 for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(name, "1")
 
@@ -129,6 +133,7 @@ class Store:
 
     def enqueue(self, kind, payload, key=None):
         with self.tx():
+            if kind in HEAVY_JOBS:require(not self.get('setting','deploymentMaintenance',{}).get('enabled'),'DEPLOYMENT_MAINTENANCE',status=503)
             if key:
                 rows = self.rows("SELECT id,payload FROM jobs WHERE request_key=?",(key,))
                 if rows:
@@ -150,11 +155,52 @@ class Store:
 
     def claim(self, owner, kinds=None):
         with self.tx():
+            if self.get('setting','deploymentMaintenance',{}).get('enabled'):return None
             rows=self.rows("SELECT id,type FROM jobs WHERE state='queued' OR (state='running' AND lease<?) ORDER BY created",(time.time(),))
             for row in rows:
                 if kinds and row["type"] not in kinds: continue
+                if row['type'] in HEAVY_JOBS:
+                    foreground=self.get('setting','foregroundLease',{})
+                    if foreground.get('expires',0)>time.time():continue
+                    busy=self.rows("SELECT id,type FROM jobs WHERE id<>? AND state IN ('running','pause_requested','cancelling') AND lease>?",(row['id'],time.time()))
+                    if any(item['type'] in HEAVY_JOBS for item in busy):continue
                 self.db.execute("UPDATE jobs SET state='running',owner=?,lease=?,fence=fence+1,attempt=attempt+1,updated=? WHERE id=?",(owner,time.time()+60,now(),row["id"]))
                 return self.job(row["id"])
+
+    @contextlib.contextmanager
+    def foreground_slot(self,timeout=60):
+        """Cross-process priority for interactive work, with expiring ownership."""
+        identity=uid();deadline=time.monotonic()+timeout;acquired=False
+        try:
+            while time.monotonic()<deadline:
+                with self.tx():
+                    require(not self.get('setting','deploymentMaintenance',{}).get('enabled'),'DEPLOYMENT_MAINTENANCE',status=503)
+                    old=self.get('setting','foregroundLease',{})
+                    if old.get('expires',0)<=time.time() or old.get('owner')==identity:
+                        self.put('setting',{'owner':identity,'expires':time.time()+90},'foregroundLease')
+                        acquired=True
+                        self.db.execute("UPDATE jobs SET state='pause_requested' WHERE type IN ('train','foundation_pretrain','foundation_cpt','foundation_sft') AND state='running' AND lease>?",(time.time(),))
+                        for running in self.rows("SELECT id FROM jobs WHERE type IN ('foundation_pretrain','foundation_cpt','foundation_sft') AND state='pause_requested' AND lease>?",(time.time(),)):
+                            self.put('foundation_run',{'pauseReason':'FOREGROUND_REQUEST'},running['id'])
+                        busy=self.rows("SELECT type FROM jobs WHERE state IN ('running','pause_requested','cancelling') AND lease>?",(time.time(),))
+                        if not any(item['type'] in HEAVY_JOBS for item in busy):break
+                time.sleep(.1)
+            else:raise Fault('BACKGROUND_YIELD_PENDING',status=503)
+            ended=threading.Event()
+            def keep_alive():
+                while not ended.wait(10):
+                    with self.tx():
+                        value=self.get('setting','foregroundLease',{})
+                        if value.get('owner')!=identity:return
+                        self.put('setting',{'expires':time.time()+90},'foregroundLease')
+            thread=threading.Thread(target=keep_alive,daemon=True);thread.start()
+            try:yield
+            finally:ended.set();thread.join(timeout=1)
+        finally:
+            if acquired:
+                with self.tx():
+                    if self.get('setting','foregroundLease',{}).get('owner')==identity:
+                        self.db.execute("DELETE FROM records WHERE kind='setting' AND id='foregroundLease'")
 
     def assert_lease(self, job):
         current=self.job(job["id"])

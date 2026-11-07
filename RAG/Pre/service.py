@@ -38,6 +38,8 @@ class PreService:
         self._generation_readers = defaultdict(int)
         self._search_cache = OrderedDict()
         with store.tx() as con:
+            con.execute("CREATE INDEX IF NOT EXISTS pre_records_document ON records(kind,json_extract(body,'$.documentId'))")
+            con.execute("CREATE INDEX IF NOT EXISTS pre_records_version ON records(kind,json_extract(body,'$.versionId'))")
             con.execute('CREATE VIRTUAL TABLE IF NOT EXISTS pre_fts USING fts5(chunk_id UNINDEXED,generation_id UNINDEXED,title,path,symbol,body,search_terms, tokenize="unicode61")')
             con.execute('CREATE TABLE IF NOT EXISTS pre_memberships(generation_id TEXT NOT NULL,chunk_id TEXT NOT NULL,vector_row INTEGER,PRIMARY KEY(generation_id,chunk_id))')
             con.execute('CREATE TABLE IF NOT EXISTS pre_active(workspace_id TEXT PRIMARY KEY,generation_id TEXT)')
@@ -217,11 +219,18 @@ class PreService:
         item = self._get('document', identifier)
         if item.get('deletedAt'):
             raise DomainError('DOCUMENT_DELETED', '삭제된 문서입니다.', 404)
-        return self._document_dto(item,detail=True)
+        version=self._get('version',item['currentVersionId']);source=self._get('source',item['sourceId'])
+        chunks=[json.loads(row['body']) for row in self.store.read("SELECT body FROM records WHERE kind='chunk' AND json_extract(body,'$.versionId')=?",(version['id'],))]
+        catalog={'document':{item['id']:item},'version':{version['id']:version},'source':{source['id']:source},
+            'chunk':{row['id']:row for row in chunks},'activeIds':{row['chunk_id'] for row in self.store.read(
+                "SELECT m.chunk_id FROM pre_memberships m JOIN records c ON c.kind='chunk' AND c.id=m.chunk_id WHERE m.generation_id=? AND json_extract(c.body,'$.versionId')=?",(self._active_id(),version['id']))}}
+        return self._document_dto(item,catalog=catalog,detail=True)
 
     def versions(self, identifier):
-        self.document(identifier)
-        return [self._version_dto(v) for v in self._all('version') if v.get('documentId') == identifier]
+        item=self._get('document',identifier)
+        if item.get('deletedAt'):raise DomainError('DOCUMENT_DELETED','DOCUMENT_DELETED',404)
+        return [self._version_dto(json.loads(row['body'])) for row in self.store.read(
+            "SELECT body FROM records WHERE kind='version' AND json_extract(body,'$.documentId')=? ORDER BY created_at DESC,id DESC",(identifier,))]
 
     def _version_dto(self, version):
         return {key: value for key, value in version.items() if key not in {'rawBlobHash', 'normalizedBlobHash', 'rawFileBlobHash', 'quarantineBlobHash'}}
@@ -509,6 +518,9 @@ class PreService:
             self._save('version', {**self._get('version',version_id),'codeStructure':analysis,'qualityRating':score,'chunkingVersion':PIPELINE_VERSION})
             for ordinal, part in enumerate(parts):
                 location = {'kind': 'record', 'positions': version['recordPositions']} if version.get('recordPositions') else {'kind': 'section', 'section': part['section'] or doc['name']} if version.get('htmlExtracted') else {'kind': 'lines', 'startLine': part['startLine'], 'endLine': part['endLine']}
+                if location['kind']=='lines' and version.get('sourceSpan',{}).get('startLine'):
+                    offset=version['sourceSpan']['startLine']-1
+                    location={**location,'startLine':location['startLine']+offset,'endLine':location['endLine']+offset}
                 self._save('chunk', {**part, **chunk_structure(part,analysis),'chunkingVersion':PIPELINE_VERSION, 'versionId': version_id, 'documentId': doc['id'], 'sourceId': doc['sourceId'], 'ordinal': ordinal, 'textBlobHash': self._blob(part['text']), 'contentHash': digest(part['text']), 'retrievalAllowed': True, 'generatorTokenCount': None, 'location': location})
             self._save('document', {**doc, 'state': 'processing' if doc.get('retrievalPolicy') == 'approved' else 'needs_review'})
 

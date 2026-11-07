@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import threading
 import time
+from datetime import datetime,timezone,timedelta
 from LLM.core import require,digest,file_hash,atomic_json,uid,now
 
 TARGET='LLM/extensions/document_policy.py'
@@ -92,14 +93,55 @@ class SelfEvolution:
 
     def enqueue(self,body,key=None):
         model=self.store.get('artifact',body['artifactId'])
+        require(not model.get('comparisonOnly'),'COMPARISON_ONLY_MODEL',status=409)
         require(not model.get('fixture') and model['kind']!='adapter','SELF_CODE_MODEL_REQUIRED')
-        return self.store.enqueue('evolve',{'artifactId':model['id'],'sourceHash':self.active_hash(),'goal':self.policy()['goal'],'fixtureId':self.policy()['fixtureId']},key)
+        if model.get('origin')=='random_init' or model.get('foundationProjectId'):
+            self._foundation_eligibility(model)
+        with self.store.tx():
+            if model.get('origin')=='random_init' or model.get('foundationProjectId'):
+                self._budget('proposals')
+            result=self.store.enqueue('evolve',{'artifactId':model['id'],'sourceHash':self.active_hash(),'goal':self.policy()['goal'],'fixtureId':self.policy()['fixtureId']},key)
+            if model.get('origin')=='random_init' or model.get('foundationProjectId'):
+                self.store.put('foundation_self_code_attempt',{'artifactId':model['id'],'week':self._week(),'state':'reserved'},result['id'])
+            return result
+
+    def _foundation_eligibility(self,model):
+        self.c.registry.verify(model)
+        eligibility=self.store.get('foundation_self_code_eligibility',model['id'],{})
+        require(eligibility.get('passed') is True and eligibility.get('artifactId')==model['id']
+            and eligibility.get('state')=='eligible' and eligibility.get('fixtureId')==self.policy().get('fixtureId')
+            and eligibility.get('sourceHash')==self.active_hash()
+            and not eligibility.get('testOnly'),'SELF_CODE_ELIGIBILITY_REQUIRED',status=409)
+        fixture=self.store.get('fixture',self.policy()['fixtureId'])
+        cert=self.store.get('certificate',eligibility.get('certificateId') or '',{})
+        require(eligibility.get('fixtureHash')==digest(fixture) and cert.get('passed') is True
+            and cert.get('usable') is True and cert.get('purpose')=='usable_release' and cert.get('state')!='revoked'
+            and cert.get('artifactId')==model['id'],'SELF_CODE_ELIGIBILITY_REQUIRED',status=409)
+        return eligibility
+
+    @staticmethod
+    def _week():
+        return '-'.join(map(str,datetime.now(timezone(timedelta(hours=9))).isocalendar()[:2]))
+
+    def _budget(self,kind):
+        week=self._week()
+        if kind=='proposals':
+            count=sum(r.get('week')==week for r in self.store.list('foundation_self_code_attempt'))
+            require(count<3,'SELF_CODE_PROPOSAL_BUDGET_EXHAUSTED',status=409)
+        else:
+            count=sum(r.get('appliedWeek')==week for r in self.store.list('self_code_proposal'))
+            require(count<1,'SELF_CODE_APPLY_BUDGET_EXHAUSTED',status=409)
 
     def run(self,job):
         policy=self.policy();source=(self.project/TARGET).read_text('utf-8');body=job['payload']
         require(digest(source.encode())==body['sourceHash'],'SELF_CODE_VERSION_CONFLICT',status=409)
-        prompt='<|im_start|>user\nWrite only the complete Python module. Keep transform(document), returning a dict with text and tags. Use no file, network or process access.\nGoal: '+body['goal']+'\nCurrent module:\n'+source+'\n<|im_end|>\n<|im_start|>assistant\n'
-        generated,timing=self.c.inference.text(body['artifactId'],prompt,768)
+        model=self.store.get('artifact',body['artifactId'])
+        content='Write only a Python module with transform(document) returning text and tags. No file, network or process access.\nGoal: '+body['goal']+'\nModule:\n'+source
+        require(not model.get('comparisonOnly'),'COMPARISON_ONLY_MODEL',status=409)
+        if model.get('origin')=='random_init' or model.get('foundationProjectId'):
+            generated,timing=self.c.foundation.runtime.text(model['id'],[{'role':'user','content':content}],min(128,int(model.get('trainedContextTokens',128))//2))
+        else:
+            generated,timing=self.c.inference.text(body['artifactId'],'<|im_start|>user\n'+content+'\n<|im_end|>\n<|im_start|>assistant\n',768)
         blocks=re.findall(r'```(?:python)?\s*\n([\s\S]*?)```',generated)
         proposed=(blocks[0] if blocks else generated).strip()+'\n'
         record=self.store.put('self_code_proposal',{'target':TARGET,'modelArtifactId':body['artifactId'],'baseHash':body['sourceHash'],
@@ -128,10 +170,14 @@ class SelfEvolution:
         return record
 
     def apply(self,identity,job=None):
-        with self.lock,self.store.tx():
+        with self.lock:
             record=self.store.get('self_code_proposal',identity)
             require(record['state']=='verified' and record.get('functionalImprovement'),'SELF_CODE_NOT_VERIFIED')
             require(record['target']==TARGET and self.active_hash()==record['baseHash'],'SELF_CODE_VERSION_CONFLICT',status=409)
+            artifact=self.store.get('artifact',record['modelArtifactId'])
+            self.c.registry.verify(artifact)
+            is_foundation=artifact.get('origin')=='random_init' or bool(artifact.get('foundationProjectId'))
+            if is_foundation:self._foundation_eligibility(artifact);self._budget('apply')
             if job:self.store.assert_lease(job)
             candidate=self.store.get('verifier_receipt',record['candidateReceiptId'])
             require(candidate['passed'] and candidate['codeHash']==record['sourceHash'],'SELF_CODE_RECEIPT_MISMATCH')
@@ -144,8 +190,20 @@ class SelfEvolution:
                 with temporary.open('w',encoding='utf-8',newline='\n') as out:out.write(record['source']);out.flush();os.fsync(out.fileno())
                 require(file_hash(temporary)==record['sourceHash'],'SELF_CODE_HASH_MISMATCH')
                 os.replace(temporary,target)
-                self.store.put('self_code_slot',{'proposalId':identity,'sourceHash':record['sourceHash'],'profileId':record['profileId']},'document')
-                return self.store.put('self_code_proposal',{'state':'applied','appliedAt':now()},identity)
+                try:
+                    canary=self.c.sandbox.verify(target.read_text('utf-8'),self.store.get('fixture',record['fixtureId']))
+                    require(canary.get('passed') is True and canary.get('codeHash')==record['sourceHash'],'SELF_CODE_CANARY_FAILED')
+                    if job:self.store.assert_lease(job)
+                    with self.store.tx():
+                        if is_foundation:self._budget('apply')
+                        self.store.put('self_code_slot',{'proposalId':identity,'sourceHash':record['sourceHash'],'profileId':record['profileId']},'document')
+                        return self.store.put('self_code_proposal',{'state':'applied','appliedAt':now(),'appliedWeek':self._week(),
+                            'canaryReceiptId':canary.get('id')},identity)
+                except BaseException:
+                    with temporary.open('w',encoding='utf-8',newline='\n') as out:out.write(old);out.flush();os.fsync(out.fileno())
+                    os.replace(temporary,target)
+                    self.store.put('self_code_proposal',{'state':'held','reasonCodes':['SELF_CODE_CANARY_FAILED']},identity)
+                    raise
             finally:temporary.unlink(missing_ok=True)
 
     def rollback(self):
@@ -180,13 +238,18 @@ class SelfEvolution:
 
     def setup(self,profile_id):
         profile=self.store.get('verifier_profile',profile_id)
-        require(profile['language']=='python' and '@sha256:' in profile['image'],'PINNED_SANDBOX_IMAGE_REQUIRED')
+        from LLM.verification.broker import pinned
+        require(profile['language']=='python' and pinned(profile),'PINNED_SANDBOX_IMAGE_REQUIRED')
+        if profile.get('purpose')!='self_code_regression':
+            profile=self.store.put('verifier_profile',{'language':'python','image':profile['image'],'purpose':'self_code_regression'})
+            profile_id=profile['id']
         # Fixed controller-authored expectations; generated code cannot edit these.
         texts=[' hello ','one\r\ntwo','\r\nalpha\r\nbeta\r\n','def add(a, b):\n    return a + b\n','한글 문서\r\n다음 줄',
             'x\ty','\n','a'*1000,' curly {json} ','a\n\n b','   x\r\ny  ','  \t끝\t ']
         cases=[{'function':'transform','args':[{'text':t,'documentId':str(i)}],
             'expected':{'text':t.replace('\r\n','\n').strip(),'tags':[]}} for i,t in enumerate(texts)]
-        fixture=self.store.put('fixture',{'profileId':profile_id,'cases':cases,'purpose':'self_code_regression','trustedControllerFixture':True})
+        fixture=self.store.put('fixture',{'profileId':profile_id,'cases':cases,'purpose':'self_code_regression',
+            'trustedControllerFixture':True,'independent':True,'targetOrigin':'controller'})
         return self.configure({'fixtureId':fixture['id']})
 
     def feedback(self,proposal):

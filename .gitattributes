@@ -1,0 +1,4 @@
+# These exact bytes are included in the backend reproducibility receipt.
+LLM/requirements.txt text eol=lf
+LLM/requirements.lock text eol=lf
+LLM/backend-lock.json text eol=lf

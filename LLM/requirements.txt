@@ -11,3 +11,4 @@ peft>=0.17,<0.22
 accelerate>=1.8,<2
 huggingface-hub>=0.34,<1
 pytest>=8,<10
+cryptography>=46,<51
