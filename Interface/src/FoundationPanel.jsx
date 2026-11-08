@@ -4,7 +4,7 @@ import { ragRequest } from './rag-api';
 import { actualNumber, collection, foundationProgress, foundationRequest, reasonLabel, stageLabel } from './foundation-api';
 import './FoundationPanel.css';
 import FoundationSources from './FoundationSources';
-import { trainingSetup } from './foundation-setup';
+import AutoTrainingPanel from './AutoTrainingPanel';
 
 const stages = [['자료', Database], ['토큰', Layers3], ['초기화', Sprout], ['학습', Activity], ['검증', FlaskConical], ['사용', Check]];
 const stageIndex = value => {
@@ -111,10 +111,15 @@ export default function FoundationPanel({ onNavigate }) {
     try {
       const result = await foundationRequest('projects');
       if (!mounted.current || selectedProject.current !== requestedProject) return;
-      const listed = collection(result); setProjects(listed); setConnected(true); setStale(false); setError('');
+      const listed = collection(result).filter(item => item.state !== 'revoked' && !item.revocationPending);
+      setProjects(listed); setConnected(true); setStale(false); setError('');
       try { const stored = await ragRequest('/training-snapshots'); if (mounted.current) setSnapshots(collection(stored)); } catch {}
       try { const measured = await foundationRequest('profiles'); if (mounted.current) setProfiles(collection(measured)); } catch {}
-      const selected = listed.find(item => item.id === projectId) ?? listed[0];
+      let preferred = projectId;
+      if (!preferred && listed.length) {
+        try { preferred = (await foundationRequest('auto-training')).projectId; } catch {}
+      }
+      const selected = listed.find(item => item.id === preferred) ?? listed[0];
       if (selected) {
         if (selected.id !== projectId) setProjectId(selected.id);
         const detail = await foundationRequest(`projects/${encodeURIComponent(selected.id)}`);
@@ -129,7 +134,7 @@ export default function FoundationPanel({ onNavigate }) {
           try { const latest = await foundationRequest(`runs/${encodeURIComponent(latestRun.id)}`); if (mounted.current && selectedProject.current === selected.id) setRun(latest); }
           catch (cause) { if (mounted.current) { setRun(latestRun); setError(cause.message); setStale(true); } }
         } else setRun(null);
-      } else { setProject(null); setRun(null); }
+      } else { setProject(null); setRun(null); if (projectId) setProjectId(''); }
       setObservedAt(new Date().toISOString());
     } catch (cause) {
       if (mounted.current) { setError(cause.status === 404 ? '자체 모델 서비스 미연결' : cause.message); setStale(true); }
@@ -223,17 +228,13 @@ export default function FoundationPanel({ onNavigate }) {
   const reasons = [...new Set([...(project?.reasonCodes ?? []), ...(project?.readiness?.reasonCodes ?? []), ...(run?.reasonCodes ?? [])])];
   const usable = phase === 'usable' && (project?.capabilityFlags?.generation === true || project?.capabilityFlags?.canServe === true);
   const disabled = busy || stale || !connected;
-  const setup = trainingSetup({ connected, stale, loading, sourceLoading, sourceError, sources, selectedSources, mode,
-    enabled: project?.policy?.enabled, running });
-  const startBlocked = disabled || sourceLoading || Boolean(sourceError) || setup.action !== 'save';
-  async function setupAction() {
-    if (setup.action === 'refresh') { load(); refreshSources(); }
-    else if (setup.action === 'data') onNavigate('data');
-    else if (setup.action === 'sources') openSources();
-    else if (setup.action === 'save') {
-      const saved = await savePolicy(true);
-      if (saved && mode === 'manual') setAdvanced(true);
-    }
+  const startBlocked = disabled || sourceLoading || Boolean(sourceError) || !selectedSources.length
+    || selectedSources.some(id => !sources.some(source => source.id === id && source.trainingPolicy === 'allowed' && source.kind !== 'local_directory'));
+  function autoStarted(result) {
+    lastProject.current = null;
+    if (result.projectId && result.projectId !== projectId) setProjectId(result.projectId);
+    else void load();
+    void refreshSources();
   }
   const policyChanged = JSON.stringify([...(project?.policy?.allowedSourceIds ?? [])].sort()) !== JSON.stringify([...selectedSources].sort())
     || policyMode(project?.policy?.automation) !== mode;
@@ -261,32 +262,27 @@ export default function FoundationPanel({ onNavigate }) {
   return <section className="card foundation-panel" aria-label="자체 기초 모델">
     <div className="foundation-header"><div className="foundation-brand"><span><Sprout size={22} strokeWidth={1.6} /></span><div><div className="foundation-eyebrow">SELF-MADE FOUNDATION</div><h2>나만의 기초 모델</h2></div></div><div className="foundation-header-actions"><span className={`status-pill ${usable ? 'ready' : 'pending'}`}><span className="dot" />{stale ? '갱신 중단' : loading ? '연결 확인' : !connected ? '미연결' : project ? stageLabel(phase) : '모델 생성 전'}</span><button className="icon-button" type="button" onClick={() => { lastProject.current = null; load(); }} disabled={loading || busy} aria-label="자체 모델 상태 새로고침"><RefreshCw size={16} /></button></div></div>
     <div className="foundation-intro"><span>{project?.origin === 'architecture_growth' ? '자체 모델 · 구조 변환' : '외부 초기값 없이 · 데이터에서 시작'}</span><span>{project ? `${number(project.parameterCount / 1000000, 2)}M` : 'S0'} <i>·</i> CPU <i>·</i> 최대 문맥 {number(project?.config?.max_position_embeddings ?? 512)}</span></div>
-    <ol className="foundation-stages">{stages.map(([label, Icon], index) => <li key={label} className={project && index === stageIndex(phase) ? 'current' : ''}><span><Icon size={16} /></span><strong>{label}</strong>{index < stages.length - 1 && <ArrowRight size={12} />}</li>)}</ol>
     {error && <div className="foundation-feedback error" role="alert">{error}</div>}
     {notice && <div className="foundation-feedback" role="status"><Check size={14} />{notice}</div>}
-    {!project ? <div className="foundation-empty"><span><Sprout size={35} strokeWidth={1.3} /></span><h3>첫 번째 시작</h3><p>토큰 학습 · 무작위 초기화 · 전체 가중치 학습</p><form onSubmit={createProject}><label className="field"><span>모델 이름</span><input aria-label="자체 모델 이름" maxLength={50} required value={name} onChange={event => setName(event.target.value)} /></label><button className="button primary" disabled={disabled || !name.trim()} type="submit">{busy ? <Loader2 size={15} className="spin" /> : <Plus size={15} />}프로젝트 만들기</button></form><small>초기화는 사용 가능 판정과 다릅니다.</small></div>
+    <AutoTrainingPanel projectId={projectId} onStarted={autoStarted} onNavigate={onNavigate} onBusyChange={setBusy} disabled={busy} />
+    {!project ? <details className="foundation-manual-project"><summary>직접 프로젝트 만들기 · 고급 설정</summary><div className="foundation-empty"><span><Sprout size={35} strokeWidth={1.3} /></span><h3>첫 번째 시작</h3><p>토큰 학습 · 무작위 초기화 · 전체 가중치 학습</p><form onSubmit={createProject}><label className="field"><span>모델 이름</span><input aria-label="자체 모델 이름" maxLength={50} required value={name} onChange={event => setName(event.target.value)} /></label><button className="button primary" disabled={disabled || !name.trim()} type="submit">{busy ? <Loader2 size={15} className="spin" /> : <Plus size={15} />}프로젝트 만들기</button></form><small>초기화는 사용 가능 판정과 다릅니다.</small></div></details>
       : <>
         <div className="foundation-project-heading"><label><span className="sr-only">자체 모델 프로젝트</span><select value={projectId} onChange={event => { setProject(null); setRun(null); setProjectId(event.target.value); }} disabled={busy}>{projects.map(item => <option key={item.id} value={item.id}>{item.name ?? item.id}</option>)}</select></label><span>{usable ? `${scope.length ? scope.join(' · ') : '승인 범위'} · 사용 가능` : '일반 생성 잠금 · 독립 검증 필요'}</span></div>
-        <section className="foundation-start" aria-label="학습 준비와 시작">
-          <div className="foundation-start-heading"><span className="foundation-start-icon"><Sprout size={22} /></span><div><h3>{setup.title}</h3><p>{setup.description}</p></div></div>
-          <div className="foundation-setup-counts"><span>등록 <strong>{sources.length}개</strong></span><span>학습 허용 <strong>{sources.filter(source => source.trainingPolicy === 'allowed' && source.kind !== 'local_directory').length}개</strong></span><span>선택 <strong>{selectedSources.length}개</strong></span></div>
-        <div className="foundation-policy-row"><span><Clock3 size={15} />학습 방식</span><div className="foundation-mode-picker" role="group" aria-label="자가학습 방식">{[['always_on_idle', '유휴 시간 자동'], ['night_window', '야간 자동'], ['manual', '수동']].map(([value, label]) => <button type="button" key={value} aria-pressed={mode === value} className={mode === value ? 'selected' : ''} disabled={disabled} onClick={() => setMode(value)}>{label}</button>)}</div><span className="foundation-policy-hint">{mode === 'night_window' ? '02:00–06:00' : mode === 'manual' ? '요청한 학습만' : '작업 우선 · 여유 자원'} · 하루 4시간</span></div>
-          <div className="foundation-controls"><button className="button primary" type="button" disabled={busy || setup.action === 'wait'} onClick={setupAction}>{busy || setup.action === 'wait' ? <Loader2 size={15} className="spin" /> : setup.action === 'save' ? <Play size={15} /> : <ArrowRight size={15} />}{busy ? '설정 처리 중' : setup.label}</button><button className="button secondary" type="button" disabled={busy} aria-expanded={showSources} onClick={() => showSources ? setShowSources(false) : openSources()}><Database size={14} />학습 자료 관리</button></div>
-          {project.policy?.enabled && <p className="foundation-start-status" role="status">{running ? '학습 작업 진행 중' : '현재 상태: ' + stageLabel(phase)}{reasons.length > 0 && ' · ' + reasons.map(reasonLabel).join(' · ')}</p>}
-        </section>
-        <section className="foundation-source-section" ref={sourceSection} tabIndex={-1} aria-label="학습 자료 설정" hidden={!showSources}>
+        {run && <div className="foundation-metrics">{[
+          ['학습 토큰', number(metrics.completed), 'target tokens'], ['완료 스텝', number(metrics.steps), 'optimizer steps'],
+          ['Loss', number(metrics.loss, 5), '실제 관측'], ['처리량', number(metrics.tokensPerSecond, 2), 'tokens / sec'],
+        ].map(([label, value, unit]) => <div key={label}><span>{label}</span><strong>{value}</strong><small>{unit}</small></div>)}</div>}
+        {run && <div className="foundation-run-progress"><div><span>{stageLabel(run.phase ?? run.state)}</span><strong>{metrics.percent === null ? '분모 대기' : `${metrics.percent}%`}</strong></div><div className="progress-track" role="progressbar" aria-label="실제 학습 노출 토큰 진행률" aria-valuemin={0} aria-valuemax={100} aria-valuenow={metrics.percent ?? undefined}><i style={{ width: `${metrics.percent ?? 0}%` }} /></div><small>{number(metrics.completed)} / {number(metrics.total)} target tokens · 사용 가능 여부는 별도 검증</small></div>}
+        {reasons.length > 0 && <div className="foundation-blockers">{reasons.map(reason => <span key={reason} title={reason}>{reasonLabel(reason)}</span>)}</div>}
+        <div className="foundation-controls">{run && <>{runState === 'paused' ? <button className="button secondary" type="button" disabled={disabled || run.capabilities?.resume !== true} onClick={() => mutate(`runs/${run.id}/resume`)}><Play size={14} />재개</button> : running && <button className="button secondary" type="button" disabled={disabled || run.capabilities?.pause !== true} onClick={() => mutate(`runs/${run.id}/pause`)}><Pause size={14} />일시정지</button>}{(running || runState === 'paused') && <button className="button secondary" type="button" disabled={disabled || run.capabilities?.cancel !== true} onClick={() => mutate(`runs/${run.id}/cancel`)}>학습 중지</button>}</>}</div>
+        <details className="foundation-details" open={advanced} onToggle={event => setAdvanced(event.currentTarget.open)}><summary>단계별 수동 제어 · 상세 정보 <span>고급</span></summary><div className="foundation-detail-content">
+    <ol className="foundation-stages">{stages.map(([label, Icon], index) => <li key={label} className={project && index === stageIndex(phase) ? 'current' : ''}><span><Icon size={16} /></span><strong>{label}</strong>{index < stages.length - 1 && <ArrowRight size={12} />}</li>)}</ol>
+        <div className="foundation-policy-row"><span><Clock3 size={15} />학습 방식</span><div className="foundation-mode-picker" role="group" aria-label="자가학습 방식">{[['always_on_idle', '유휴 시간 자동'], ['night_window', '야간 자동'], ['manual', '수동']].map(([value, label]) => <button type="button" key={value} aria-pressed={mode === value} className={mode === value ? 'selected' : ''} disabled={disabled} onClick={() => setMode(value)}>{label}</button>)}</div><span className="foundation-policy-hint">{mode === 'night_window' ? '02:00–06:00' : mode === 'manual' ? '요청한 학습만' : '작업 우선 · 여유 자원'} · 하루 4시간</span></div><button className="button secondary" type="button" onClick={() => showSources ? setShowSources(false) : openSources()} aria-expanded={showSources}><Database size={14} />학습 자료 직접 관리</button>        <section className="foundation-source-section" ref={sourceSection} tabIndex={-1} aria-label="학습 자료 설정" hidden={!showSources}>
           <div className="foundation-source-heading"><h3>학습할 자료 선택</h3><button className="text-button" type="button" disabled={busy || sourceLoading} onClick={() => refreshSources()}><RefreshCw size={13} />목록 새로고침</button></div>
           {sourceError && <p className="foundation-feedback error" role="alert">{sourceError}</p>}
           {sourceLoading ? <p className="foundation-setup-copy">자료 목록 확인 중…</p> : <FoundationSources sources={sources} selectedSources={selectedSources} onSelection={setSelectedSources} disabled={disabled || Boolean(sourceError)} onApprove={approveSource} onAddData={() => onNavigate('data')} />}
         </section>
-        <div className="foundation-metrics">{[
-          ['학습 토큰', number(metrics.completed), 'target tokens'], ['완료 스텝', number(metrics.steps), 'optimizer steps'],
-          ['Loss', number(metrics.loss, 5), '실제 관측'], ['처리량', number(metrics.tokensPerSecond, 2), 'tokens / sec'],
-        ].map(([label, value, unit]) => <div key={label}><span>{label}</span><strong>{value}</strong><small>{unit}</small></div>)}</div>
-        {run && <div className="foundation-run-progress"><div><span>{stageLabel(run.phase ?? run.state)}</span><strong>{metrics.percent === null ? '분모 대기' : `${metrics.percent}%`}</strong></div><div className="progress-track" role="progressbar" aria-label="실제 학습 노출 토큰 진행률" aria-valuemin={0} aria-valuemax={100} aria-valuenow={metrics.percent ?? undefined}><i style={{ width: `${metrics.percent ?? 0}%` }} /></div><small>{number(metrics.completed)} / {number(metrics.total)} target tokens · 사용 가능 여부는 별도 검증</small></div>}
-        {reasons.length > 0 && <div className="foundation-blockers">{reasons.map(reason => <span key={reason} title={reason}>{reasonLabel(reason)}</span>)}</div>}
-        <div className="foundation-controls">{project.policy?.enabled && <button className="button secondary" type="button" disabled={disabled} onClick={() => savePolicy(false)}><Square size={14} />자동화 중지</button>}{run && <>{runState === 'paused' ? <button className="button secondary" type="button" disabled={disabled || run.capabilities?.resume !== true} onClick={() => mutate(`runs/${run.id}/resume`)}><Play size={14} />재개</button> : running && <button className="button secondary" type="button" disabled={disabled || run.capabilities?.pause !== true} onClick={() => mutate(`runs/${run.id}/pause`)}><Pause size={14} />일시정지</button>}{(running || runState === 'paused') && <button className="button secondary" type="button" disabled={disabled || run.capabilities?.cancel !== true} onClick={() => mutate(`runs/${run.id}/cancel`)}>학습 중지</button>}</>}</div>
-        <details className="foundation-details" open={advanced} onToggle={event => setAdvanced(event.currentTarget.open)}><summary>단계별 수동 제어 · 상세 정보 <span>고급</span></summary><div className="foundation-detail-content"><p className="foundation-setup-copy">수동 실행 순서: 자료 검사 → 토큰 학습 → 초기화 → 실측 → 기초학습. 자동 모드에서는 위에서 자동 학습을 켜면 순서대로 진행합니다.</p><button className="button secondary" type="button" disabled={startBlocked || !policyChanged} onClick={() => savePolicy()}><Check size={14} />출처 · 방식 저장</button><div className="foundation-corpus-type"><label className="field"><span>학습 자료</span><select value={corpusKind} onChange={event => setCorpusKind(event.target.value)} disabled={disabled}><option value="raw">원문 · 기초학습 / CPT</option><option value="sft">승인 응답 · SFT</option></select></label>{corpusKind === 'sft' && <label className="field"><span>승인 스냅샷</span><select value={snapshotId} onChange={event => setSnapshotId(event.target.value)} disabled={disabled}><option value="">스냅샷 선택</option>{snapshots.filter(item => item.status === 'ready').map(item => <option key={item.id} value={item.id}>{item.name ?? item.id} · {item.exampleCount ?? '—'}개</option>)}</select></label>}</div><div className="foundation-stage-actions">
+<p className="foundation-setup-copy">수동 실행 순서: 자료 검사 → 토큰 학습 → 초기화 → 실측 → 기초학습. 기본 화면의 학습하기는 이 과정을 자동으로 진행합니다.</p><button className="button secondary" type="button" disabled={startBlocked || !policyChanged} onClick={() => savePolicy()}><Check size={14} />출처 · 방식 저장</button><div className="foundation-corpus-type"><label className="field"><span>학습 자료</span><select value={corpusKind} onChange={event => setCorpusKind(event.target.value)} disabled={disabled}><option value="raw">원문 · 기초학습 / CPT</option><option value="sft">승인 응답 · SFT</option></select></label>{corpusKind === 'sft' && <label className="field"><span>승인 스냅샷</span><select value={snapshotId} onChange={event => setSnapshotId(event.target.value)} disabled={disabled}><option value="">스냅샷 선택</option>{snapshots.filter(item => item.status === 'ready').map(item => <option key={item.id} value={item.id}>{item.name ?? item.id} · {item.exampleCount ?? '—'}개</option>)}</select></label>}</div><div className="foundation-stage-actions">
           <button type="button" disabled={disabled || !selectedSources.length || policyChanged || (corpusKind === 'sft' && !snapshotId)} onClick={createCorpus}><Database size={15} />자료 검사</button>
           <button type="button" disabled={disabled || !valid(corpus) || sftCorpus || Boolean(project.genesisId)} onClick={createTokenizer}><Layers3 size={15} />토큰 학습</button>
           <button type="button" disabled={disabled || !valid(tokenizer) || Boolean(project.genesisId)} onClick={initialize}><Sprout size={15} />초기화</button>

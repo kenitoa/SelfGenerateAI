@@ -19,8 +19,8 @@ from .discovery import Discovery
 from .balance import select as balanced_select, record as record_balance, labels
 
 DEFAULTS={
-    'version':1,'enabled':True,'intervalMinutes':60,'maxPagesPerRun':6,'dailyPages':60,
-    'maxDepth':2,'maxFrontier':3000,'delaySeconds':1.5,'maxPageBytes':2*1024**2,
+    'version':1,'enabled':True,'intervalMinutes':30,'maxPagesPerRun':10,'dailyPages':300,
+    'maxDepth':2,'maxFrontier':3000,'delaySeconds':2,'maxPageBytes':2*1024**2,
     'githubEnabled':True,'sitemapEnabled':True,'feedEnabled':True,'commonCrawlEnabled':True,
     'browserEnabled':True,'maxRendered':1,'codeOnly':True,
     'fairScheduling':True,'languageWeights':{'python':1,'javascript':1,'typescript':1,'go':1,'rust':1,'java':1,'cpp':1},
@@ -29,6 +29,9 @@ DEFAULTS={
     'githubQueries':['language:Python size:<500 archived:false fork:false','language:TypeScript size:<500 archived:false fork:false','language:Go size:<500 archived:false fork:false','language:Rust size:<500 archived:false fork:false','language:Java size:<500 archived:false fork:false','language:C++ size:<500 archived:false fork:false'],
     'commonCrawlPatterns':['docs.python.org/3/tutorial/introduction.html'],
 }
+
+LEGACY_COLLECTION_LIMITS={'intervalMinutes':60,'maxPagesPerRun':6,'dailyPages':60,'delaySeconds':1.5}
+COLLECTION_DEFAULTS_REVISION=2
 
 
 class CrawlerService:
@@ -41,7 +44,7 @@ class CrawlerService:
                 meta TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 0,next_at REAL NOT NULL DEFAULT 0,
                 last_error TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS crawl_due ON crawl_frontier(state,next_at,priority,created_at);''')
-        if store.setting('crawler') is None:store.set_setting('crawler',dict(DEFAULTS))
+        self._initialize_defaults()
         # Earlier crawler versions stored immutable URLs without a repository watch.
         for source in store.list('source'):
             if not source.get('crawlerManaged'):continue
@@ -51,6 +54,24 @@ class CrawlerService:
                 family=source.get('repositoryFamily') or repository
                 store.put('source',{'repository':repository,'repositoryPath':path,'repositoryFamily':family if family.startswith('https://github.com/') else 'https://github.com/'+family},id=source['id'])
                 self._track_repository({'repository':repository,'revision':parts[2]})
+
+    def _initialize_defaults(self):
+        # Stored configurations override DEFAULTS. Upgrade the former default
+        # profile once, preserving explicit custom limits, pauses and backoffs.
+        with self.store.tx():
+            old=self.store.setting('crawler')
+            if old is None:
+                self.store.set_setting('crawler',dict(DEFAULTS))
+            receipt=self.store.setting('crawlerDefaultsRevision',{})
+            if receipt.get('revision',0)>=COLLECTION_DEFAULTS_REVISION:return
+            migrated=old is not None and all(old.get(key)==value for key,value in LEGACY_COLLECTION_LIMITS.items())
+            if migrated:
+                self.store.set_setting('crawler',{**DEFAULTS,**old,'version':old.get('version',1)+1,
+                    **{key:DEFAULTS[key] for key in LEGACY_COLLECTION_LIMITS}})
+                self.store.activity('crawler_configured','workspace','자동 수집 기본 한도 갱신 · 하루 300페이지 / 30분마다 10페이지 / 요청 간격 2초')
+            self.store.set_setting('crawlerDefaultsRevision',{'revision':COLLECTION_DEFAULTS_REVISION,
+                'state':'updated' if migrated else 'initialized' if old is None else 'preserved_custom',
+                'appliedAt':now()})
 
     def config(self):return {**DEFAULTS,**self.store.setting('crawler',{})}
 

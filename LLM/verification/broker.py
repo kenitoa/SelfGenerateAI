@@ -50,7 +50,12 @@ class VerifierBroker:
             self.store.db.execute("UPDATE verifier_requests SET state='expired',owner=NULL,payload=NULL,result=NULL,error='VERIFIER_DRIVER_RESTARTED',fence=fence+1 WHERE id=? AND owner=?", (identity,owner))
 
     def status(self):
-        rows = self.store.rows('SELECT owner,seen,capabilities FROM verifier_driver WHERE id=1')
+        return self.read_status(self.store)
+
+    @staticmethod
+    def read_status(store):
+        """Observe liveness without constructing the schema-writing broker."""
+        rows = store.rows('SELECT owner,seen,capabilities FROM verifier_driver WHERE id=1')
         live = bool(rows) and 0 <= time.time() - rows[0]['seen'] <= HEARTBEAT_SECONDS
         caps = json.loads(rows[0]['capabilities']) if live else {}
         return {**caps, 'alive': live, 'available': live and caps.get('available') is True,

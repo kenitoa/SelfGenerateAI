@@ -7,10 +7,11 @@ import json
 import os
 import re
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import anyio
 from fastapi import FastAPI, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
@@ -121,7 +122,9 @@ def create_app(data_dir=None, *, start_worker=True, local_dev=False, pre_service
                     json.dumps(payload,allow_nan=False)
                 except (json.JSONDecodeError,ValueError):raise DomainError('INVALID_JSON','올바른 JSON 요청이 필요합니다.',422)
             if request.url.path.startswith('/api/') and request.url.path not in ('/api/v1/auth/me','/api/v1/auth/login','/api/v1/health/live','/api/v1/health/ready'):
-                request.state.session=auth.authorize(request)
+                # Session reads can wait for the ingestion/backup writer. Keep
+                # that wait off the event loop so health and other clients work.
+                request.state.session=await run_in_threadpool(auth.authorize,request)
             response=await call_next(request)
         except DomainError as exc:response=error_response(exc,request.state.request_id)
         response.headers['X-Request-ID']=request.state.request_id
@@ -149,21 +152,24 @@ def create_app(data_dir=None, *, start_worker=True, local_dev=False, pre_service
         if not key:return await run_in_threadpool(callback)
         if len(key)>128:raise DomainError("INVALID_IDEMPOTENCY_KEY","요청 키가 너무 깁니다.",422)
         identity=request.url.path+':'+key;request_hash=digest(body)
-        with store.tx() as db:
-            db.execute('DELETE FROM idempotency WHERE created_at<?',(time.time()-86400,))
-            existing=db.execute('SELECT * FROM idempotency WHERE key=?',(identity,)).fetchone()
-            if existing:
-                if existing['request_hash']!=request_hash:raise DomainError("IDEMPOTENCY_CONFLICT","같은 요청 키의 내용이 다릅니다.",409)
-                if existing['status']=='pending':raise DomainError("REQUEST_IN_PROGRESS","같은 요청을 처리하고 있습니다.",409)
-                return JSONResponse(json.loads(existing['resource']),status_code=status)
-            db.execute('INSERT INTO idempotency VALUES(?,?,?,?,?)',(identity,request_hash,'pending',None,time.time()))
-        try:
-            value=await run_in_threadpool(callback)
-        except BaseException:
-            with store.tx() as db:db.execute('DELETE FROM idempotency WHERE key=?',(identity,))
-            raise
-        with store.tx() as db:db.execute("UPDATE idempotency SET status='completed',resource=? WHERE key=?",(json.dumps(value,ensure_ascii=False),identity))
-        return JSONResponse(value,status_code=status)
+        def execute():
+            # Claim, callback and completion use the same worker thread. No
+            # SQLite transaction or store lock is ever acquired by the loop.
+            with store.tx() as db:
+                db.execute('DELETE FROM idempotency WHERE created_at<?',(time.time()-86400,))
+                existing=db.execute('SELECT * FROM idempotency WHERE key=?',(identity,)).fetchone()
+                if existing:
+                    if existing['request_hash']!=request_hash:raise DomainError("IDEMPOTENCY_CONFLICT","같은 요청 키의 내용이 다릅니다.",409)
+                    if existing['status']=='pending':raise DomainError("REQUEST_IN_PROGRESS","같은 요청을 처리하고 있습니다.",409)
+                    return JSONResponse(json.loads(existing['resource']),status_code=status)
+                db.execute('INSERT INTO idempotency VALUES(?,?,?,?,?)',(identity,request_hash,'pending',None,time.time()))
+            try:value=callback()
+            except BaseException:
+                with store.tx() as db:db.execute('DELETE FROM idempotency WHERE key=?',(identity,))
+                raise
+            with store.tx() as db:db.execute("UPDATE idempotency SET status='completed',resource=? WHERE key=?",(json.dumps(value,ensure_ascii=False),identity))
+            return JSONResponse(value,status_code=status)
+        return await run_in_threadpool(execute)
 
     @app.get('/api/v1/auth/me')
     def me(request:Request,response:Response):
@@ -176,14 +182,14 @@ def create_app(data_dir=None, *, start_worker=True, local_dev=False, pre_service
     @app.post('/api/v1/auth/login')
     async def login(request:Request,response:Response):
         body=await request.json()
-        return auth.login(request,response,body.get('password',''))
+        return await run_in_threadpool(auth.login,request,response,body.get('password',''))
 
     @app.post('/api/v1/auth/logout')
     def logout(request:Request,response:Response):
         store.delete('session',request.state.session['id']);response.delete_cookie('seed_session',path='/');return {"authenticated":False}
 
     @app.get('/api/v1/health/live')
-    def live():return {"status":"alive","observedAt":now()}
+    async def live():return {"status":"alive","observedAt":now()}
 
     @app.get('/api/v1/health/ready')
     def ready():
@@ -231,7 +237,9 @@ def create_app(data_dir=None, *, start_worker=True, local_dev=False, pre_service
 
     @app.patch('/api/v1/settings')
     async def update_settings(request:Request):
-        body=await request.json()
+        return await run_in_threadpool(apply_settings,await request.json(),request.headers.get('if-match','').strip('"'))
+
+    def apply_settings(body,expected):
         if not isinstance(body,dict):raise DomainError('INVALID_SETTINGS','설정은 JSON 객체여야 합니다.',422)
         def endpoint(value,empty=False):
             from urllib.parse import urlparse
@@ -265,9 +273,12 @@ def create_app(data_dir=None, *, start_worker=True, local_dev=False, pre_service
         if 'enabled' in embedding and not isinstance(embedding['enabled'],bool):raise DomainError('INVALID_EMBEDDING_CONFIG','임베딩 활성화 값이 올바르지 않습니다.',422)
         for key in ('directory','modelPath','tokenizerPath','revision'):
             if key in embedding and not isinstance(embedding[key],str):raise DomainError('INVALID_EMBEDDING_CONFIG','임베딩 경로·리비전을 확인하세요.',422)
-        with store.tx():
+        llm=getattr(app.state,'llm',None)
+        # Foundation policy updates take LLM -> RAG. Settings that also change
+        # the LLM controller must use that same order, including legacy auto.
+        # Keep both updates within their existing transaction boundaries.
+        with (llm.store.tx() if llm is not None and {'auto','memory'} & set(body) else nullcontext()),store.tx():
             old=store.setting('settings',{})
-            expected=request.headers.get('if-match','').strip('"')
             if not expected or expected!=str(old.get('version',1)):raise DomainError("SETTINGS_CONFLICT","설정을 새로고침한 뒤 저장하세요.",412)
             allowed={'name','endpoint','model','memory','schedule','auto','training','contextTokens','maxOutputTokens','tokenizerPath','embedding','allowedSourceHosts','retrieval','allowedOrigins','trainingSnapshotId'}
             unknown=set(body)-allowed-{'version'}
@@ -296,7 +307,7 @@ def create_app(data_dir=None, *, start_worker=True, local_dev=False, pre_service
 
     @app.post('/api/v1/uploads',status_code=202)
     async def upload(request:Request):
-        resource_guard(store)
+        await run_in_threadpool(resource_guard,store)
         length=request.headers.get('content-length')
         try:
             if length and int(length)>26*1024**2:raise DomainError('UPLOAD_TOO_LARGE','요청 전체 크기를 초과했습니다.',413)
@@ -322,7 +333,7 @@ def create_app(data_dir=None, *, start_worker=True, local_dev=False, pre_service
     @app.get('/api/v1/datasets/{id}')
     def dataset(id:str):return pre.dataset(id)
     @app.patch('/api/v1/datasets/{id}')
-    async def patch_dataset(id:str,request:Request):return pre.update_dataset(id,await request.json())
+    async def patch_dataset(id:str,request:Request):return await run_in_threadpool(pre.update_dataset,id,await request.json())
     @app.delete('/api/v1/datasets/{id}')
     def delete_dataset(id:str):return pre.delete_dataset(id)
     @app.get('/api/v1/datasets/{id}/documents')
@@ -351,7 +362,7 @@ def create_app(data_dir=None, *, start_worker=True, local_dev=False, pre_service
     @app.get('/api/v1/sources/{id}')
     def source(id:str):return store.get('source',id)
     @app.patch('/api/v1/sources/{id}')
-    async def patch_source(id:str,request:Request):return pre.update_source(id,await request.json())
+    async def patch_source(id:str,request:Request):return await run_in_threadpool(pre.update_source,id,await request.json())
     @app.delete('/api/v1/sources/{id}')
     def delete_source(id:str,purgeDocuments:bool=False):return pre.delete_source(id,purge=purgeDocuments)
     @app.post('/api/v1/sources/{id}/sync',status_code=202)
@@ -395,13 +406,13 @@ def create_app(data_dir=None, *, start_worker=True, local_dev=False, pre_service
     def run(id:str):return post.run(id)
     @app.get('/api/v1/generation-runs/{id}/events')
     async def events(id:str,request:Request):
-        post.run(id)
+        await run_in_threadpool(post.run,id)
         try:after=int(request.headers.get('last-event-id') or request.query_params.get('after',0))
         except ValueError:raise DomainError('INVALID_EVENT_CURSOR','잘못된 이벤트 위치입니다.',422)
-        post.events(id,after)  # Validate cursor/retention before streaming headers.
+        await run_in_threadpool(post.events,id,after)  # Validate before streaming headers.
         async def stream():
             cursor=after;last_ping=time.monotonic()
-            post.subscribe(id,1)
+            await run_in_threadpool(post.subscribe,id,1)
             try:
                 while True:
                     if await request.is_disconnected():break
@@ -422,7 +433,8 @@ def create_app(data_dir=None, *, start_worker=True, local_dev=False, pre_service
                     if time.monotonic()-last_ping>10:
                         yield ': heartbeat\n\n';last_ping=time.monotonic()
                     await asyncio.sleep(.15)
-            finally:post.subscribe(id,-1)
+            finally:
+                with anyio.CancelScope(shield=True):await run_in_threadpool(post.subscribe,id,-1)
         return StreamingResponse(stream(),media_type='text/event-stream',headers={'X-Accel-Buffering':'no','Cache-Control':'no-cache'})
     @app.post('/api/v1/generation-runs/{id}/cancel')
     def cancel_run(id:str):return post.cancel_run(id)
@@ -441,7 +453,9 @@ def create_app(data_dir=None, *, start_worker=True, local_dev=False, pre_service
         body=await request.json();return await mutation(request,body,lambda:runtime.operations.save_schedule(body),201)
     @app.patch('/api/v1/schedules/{id}')
     async def edit_schedule(id:str,request:Request):
-        old=store.get('schedule',id);return runtime.operations.save_schedule({**old,**await request.json()},id)
+        body=await request.json()
+        def edit():return runtime.operations.save_schedule({**store.get('schedule',id),**body},id)
+        return await run_in_threadpool(edit)
     @app.delete('/api/v1/schedules/{id}')
     def delete_schedule(id:str):store.delete('schedule',id);return {'deleted':True}
     @app.get('/api/v1/training-examples')
@@ -538,7 +552,7 @@ def create_app(data_dir=None, *, start_worker=True, local_dev=False, pre_service
     @app.get('/api/v1/crawler/config')
     def crawler_config():return runtime.crawler.config()
     @app.patch('/api/v1/crawler/config')
-    async def crawler_configure(request:Request):return runtime.crawler.configure(await request.json())
+    async def crawler_configure(request:Request):return await run_in_threadpool(runtime.crawler.configure,await request.json())
     @app.post('/api/v1/crawler/run',status_code=202)
     async def crawler_run(request:Request):return await mutation(request,{},runtime.crawler.enqueue,202)
     @app.get('/api/v1/crawler/frontier')

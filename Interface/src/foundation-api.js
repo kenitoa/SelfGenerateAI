@@ -16,6 +16,9 @@ export function foundationProgress(run) {
 }
 
 const reasons = {
+  CRAWLER_PAUSED: '자료 자동 수집 중지됨', CRAWL_DAILY_LIMIT: '오늘 수집량 한도 도달', SOURCE_COLLECTION_DISABLED: '일부 출처 수집 중지됨',
+  NO_ELIGIBLE_SOURCE_VERSIONS: '학습 가능한 원문 준비 중', INSUFFICIENT_NEW_TRAIN_DATA: '새 학습 자료 수집 중',
+  AGGREGATE_MEMORY_BUDGET_UNAVAILABLE: '학습 메모리 부족', DISK_LOW: '저장 공간 부족', RAG_POLICY_GATEWAY_REQUIRED: '자료 서버 연결 필요',
   MODEL_NOT_REGISTERED: '모델 생성 전', BRANCH_REQUIRED: '전문화 전', CORPUS_PERMISSION_REQUIRED: '출처 승인',
   INSUFFICIENT_CORPUS: '자료 대기', TOKENIZER_VOCAB_INCOMPLETE: '토큰 자료 부족',
   DAILY_BUDGET_EXHAUSTED: '일일 예산', RESOURCE_PRESSURE: '자원 대기', RESOURCE_UNAVAILABLE: '실행 자원 없음',

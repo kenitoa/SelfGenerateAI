@@ -81,12 +81,24 @@ class FoundationController:
                 p['trainedContextCheckpointId']=latest_checkpoint['id']
             except (Fault,ValueError,KeyError,StopIteration,TypeError):
                 p['trainedContextReasonCode']='CHECKPOINT_STATE_UNVERIFIED'
+        worker_available = self.has_worker()
         reasons = []
         if not p['policy'].get('allowedSourceIds'):reasons.append('CORPUS_PERMISSION_REQUIRED')
         if not p.get('activeCorpusId'):reasons.append('INSUFFICIENT_CORPUS')
-        if not self.has_worker():reasons.append('ISOLATED_TRAINER_REQUIRED')
+        active_corpus = next((row for row in p['corpora'] if row['id']==p.get('activeCorpusId')), {})
+        if active_corpus and active_corpus.get('state') != 'ready':
+            reasons.extend(active_corpus.get('reasonCodes', ['INSUFFICIENT_CORPUS']))
+            # Correct the presentation of projects saved by earlier releases,
+            # which advanced held corpora to waiting_tokenizer prematurely.
+            if not p.get('tokenizerId') and p.get('stage') == 'waiting_tokenizer':p['stage']='waiting_corpus'
+        if not worker_available:reasons.append('ISOLATED_TRAINER_REQUIRED')
         if p.get('state') == 'revoked':reasons.append('POLICY_REVOKED')
-        p['reasonCodes'] = list(dict.fromkeys([*p.get('reasonCodes',[]),*reasons]))
+        # Worker liveness is a current observation, not a permanent project
+        # failure. Keep the stored failure for audit, but do not display it as
+        # an active blocker after a valid worker heartbeat has recovered.
+        persisted = [reason for reason in p.get('reasonCodes', []) if reason != 'ISOLATED_TRAINER_REQUIRED']
+        p['reasonCodes'] = list(dict.fromkeys([*persisted,*reasons]))
+        p['workerAvailable'] = worker_available
         from .retention import plan
         cached=getattr(self,'_storage_plans',{})
         saved=cached.get(identity,{})
@@ -95,7 +107,7 @@ class FoundationController:
             self._storage_plans=cached
         p['storage']=cached[identity]['value']
         p['capabilityFlags'] = {'canPrepareCorpus': bool(p['policy'].get('allowedSourceIds')),
-            'canInitialize':bool(p.get('tokenizerId')), 'canTrain':bool(p.get('genesisId') or p.get('latestCheckpointId')) and self.has_worker(),
+            'canInitialize':bool(p.get('tokenizerId')), 'canTrain':bool(p.get('genesisId') or p.get('latestCheckpointId')) and worker_available,
             'canServe':p.get('state')!='revoked' and not p.get('revocationPending') and any(r.get('projectId')==identity and
                 self.store.get('release',r['id'],r).get('state')=='active' for r in self.store.list('foundation_release')),
             'selfCodeEligible':any(r.get('projectId')==identity and r.get('state')=='eligible' and r.get('passed') is True
@@ -107,14 +119,10 @@ class FoundationController:
     def has_worker(self):
         if self.control.execution_scope=='pc_validation' and self.control.worker_enabled:return True
         if self.control.worker_enabled and isolated_network():return True
-        current = datetime.now(timezone.utc)
-        for record in self.store.list('worker'):
-            try:recent = (current-datetime.fromisoformat(record['observedAt'].replace('Z','+00:00'))).total_seconds()<60
-            except (KeyError,ValueError):continue
-            if recent and record.get('executionScope','nas')==self.control.execution_scope and record.get('state')=='online' and record.get('foundationSharedVolume') is True and 'foundation_pretrain' in record.get('capabilities',[]):return True
-        return False
+        from .worker_status import has_shared_worker
+        return has_shared_worker(self.store, execution_scope=self.control.execution_scope)
 
-    def create_project(self, body, *, trusted_test=False,trusted_growth_receipt=None):
+    def create_project(self, body, *, trusted_test=False,trusted_growth_receipt=None,return_status=True):
         require(isinstance(body,dict),'CONFIG_INVALID')
         allowed={'name','origin','pretrainedWeightArtifactIds','architecture','architecturePreset','automation','policyId','seed'}
         require(body.get('origin','random_init')=='random_init' and not body.get('pretrainedWeightArtifactIds'), 'EXTERNAL_WEIGHTS_FORBIDDEN')
@@ -140,7 +148,7 @@ class FoundationController:
                 'activeCorpusId':None,'tokenizerId':None,'genesisId':None,'latestCheckpointId':None,'reasonCodes':[]})
             self.store.put('foundation_policy',policy,p['id'])
         self.store.event('foundation.project.created',p['id'],{'origin':'random_init'})
-        return self.status(p['id'])
+        return self.status(p['id']) if return_status else p
 
     def configure(self, identity, body, expected=None):
         project=self._project(identity); old=project['policy']
@@ -509,8 +517,12 @@ class FoundationController:
                 'selection':body.get('selection'),'upstreamExcludedCounts':body.get('upstreamExcludedCounts',{}),
                 'ragSnapshotId':body.get('ragSnapshotId')},value['id'])
             fields={'activeSftCorpusId':value['id']} if purpose=='sft' else {'activeCorpusId':value['id']}
-            if not p.get('tokenizerId'):fields['stage']='waiting_tokenizer'
-            self.store.put('foundation_project',{**fields,'reasonCodes':[]},p['id'])
+            if value.get('state') != 'ready':
+                # A completed corpus job can still have insufficient eligible
+                # data. Tokenizer work is only possible after that gate passes.
+                fields['stage']='waiting_corpus'
+            elif not p.get('tokenizerId'):fields['stage']='waiting_tokenizer'
+            self.store.put('foundation_project',{**fields,'reasonCodes':value.get('reasonCodes',[])},p['id'])
             if body.get('inputId') and value.get('state')=='ready':
                 require(path.parent==inside(self.store.root,'foundation/inputs/'+body['inputId']) and not path.is_symlink(),'PATH_OUTSIDE_SCOPE')
                 path.unlink();path.parent.rmdir()
@@ -984,6 +996,12 @@ class FoundationController:
 
     def dispatch(self, path, method, body, key=None, expected=None):
         bits=[b for b in path.strip('/').split('/') if b]
+        if bits==['auto-training'] or len(bits)==3 and bits[0]=='projects' and bits[2]=='auto-training':
+            require(method in ('GET','POST'),'METHOD_NOT_ALLOWED',status=405)
+            from .autopilot import AutoTraining
+            automatic=AutoTraining(self.control)
+            identity=bits[1] if len(bits)==3 else None
+            return automatic.start(identity,body,key) if method=='POST' else automatic.plan(identity)
         if bits==['projects']:
             require(method in ('GET','POST'),'METHOD_NOT_ALLOWED',status=405)
             return self.create_project(body) if method=='POST' else {'items':[self.status(p['id']) for p in self.store.list('foundation_project')]}
@@ -992,7 +1010,14 @@ class FoundationController:
             identity,action=bits[1:]
             if action=='policy':
                 require(method in ('GET','PATCH'),'METHOD_NOT_ALLOWED',status=405)
-                return self.configure(identity,body,int(expected.strip('"')) if expected else body.get('expectedVersion')) if method=='PATCH' else self._project(identity)['policy']
+                if method=='GET':return self._project(identity)['policy']
+                if body.get('enabled') is False or body.get('automation')=='manual':
+                    with self.store.tx():
+                        result=self.configure(identity,body,int(expected.strip('"')) if expected else body.get('expectedVersion'))
+                        automatic=self.store.get('foundation_auto_training',identity,{})
+                        if automatic:self.store.put('foundation_auto_training',{'enabled':False},identity)
+                    return result
+                return self.configure(identity,body,int(expected.strip('"')) if expected else body.get('expectedVersion'))
             if action=='growth' and method=='GET':return self.growth(identity)
             if action=='acceptance' and method=='GET':
                 from .acceptance import assess

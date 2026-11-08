@@ -53,15 +53,11 @@ def main():
     parser.add_argument('--health',action='store_true')
     args=parser.parse_args()
     if args.health:
-        from datetime import datetime,timezone
         from .resources import isolated_network
-        store=Store(Path(args.data_dir))
+        from .worker_status import has_shared_worker
+        store=Store.open_existing(Path(args.data_dir),read_only=True)
         try:
-            current=datetime.now(timezone.utc)
-            online=any(r.get('foundationSharedVolume') is True and r.get('state')=='online'
-                and (current-datetime.fromisoformat(r['observedAt'].replace('Z','+00:00'))).total_seconds()<45
-                for r in store.list('worker') if r.get('observedAt'))
-            if not online or not isolated_network():raise SystemExit(1)
+            if not has_shared_worker(store,max_age=45) or not isolated_network():raise SystemExit(1)
         finally:store.close()
         return
     from LLM.service import Control

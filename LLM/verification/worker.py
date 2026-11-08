@@ -83,12 +83,12 @@ def main():
     parser.add_argument('--serve',action='store_true')
     parser.add_argument('--health',action='store_true')
     args=parser.parse_args()
-    store=Store(args.data_dir)
+    store=Store.open_existing(args.data_dir,read_only=True) if args.health else Store(args.data_dir)
     try:
         if args.health:
             # Liveness is independent of Docker limit support. A NAS may remain
             # healthy while the UI correctly holds evaluation for missing caps.
-            return 0 if VerifierBroker(store).status()['alive'] else 1
+            return 0 if VerifierBroker.read_status(store)['alive'] else 1
         if not args.serve:parser.error('--serve or --health is required')
         VerifierDriver(store).serve()
     finally:store.close()

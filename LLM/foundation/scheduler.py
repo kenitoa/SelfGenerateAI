@@ -2,22 +2,33 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
+import threading
 import time
 
-from LLM.core import Fault, digest, now, require
+from LLM.core import Fault, digest, now, require, uid
 
 KST = timezone(timedelta(hours=9))
 ACTIVE = {"queued", "running", "pause_requested", "cancelling"}
+PREPARING = frozenset(('preparing_corpus', 'tokenizer_training', 'initializing', 'running', 'resuming',
+                      'pretraining', 'preparing_instruction_data', 'instruction_training'))
 
 
 class FoundationScheduler:
     def __init__(self, control):
         self.control, self.store = control, control.store
         self.last_check = {}
+        self._check_lock = threading.RLock()
+        self._check_owner = 'foundation-scheduler-' + uid()
 
     def _status(self, project, state, reasons, **extra):
+        delay = project.get('policy', {}).get('checkIntervalSeconds', 300)
+        if self.store.get('foundation_auto_training', project['id'], {}).get('enabled') is True:
+            delay = min(delay, 30)
+        if state in PREPARING:
+            delay = min(delay, 5)
         value = {"projectId": project["id"], "state": state, "reasonCodes": reasons,
-                 "checkedAt": now(), "nextAttemptAt": (datetime.now(timezone.utc)+timedelta(minutes=5)).isoformat(), **extra}
+                 "checkedAt": now(), "nextAttemptAt": (datetime.now(timezone.utc)+timedelta(seconds=delay)).isoformat(), **extra}
         return self.store.put("foundation_scheduler", value, project["id"])
 
     def _foundation(self):
@@ -27,6 +38,11 @@ class FoundationScheduler:
 
     def _start_training(self, project, body, stage):
         foundation = self._foundation()
+        if not body.get('config'):
+            from .resources import save_recommended_training_config
+            recommendation = save_recommended_training_config(self.store, project, stage)
+            require(not recommendation['reasonCodes'], recommendation['reasonCodes'][0] if recommendation['reasonCodes'] else 'RESOURCE_UNAVAILABLE', status=503)
+            body = {**body, 'config': recommendation['config']}
         try:
             result = foundation.start_training(project["id"], body, stage=stage)
             self.store.put("foundation_automation_job", {"projectId": project["id"], "jobId": result["id"]}, result["id"])
@@ -105,21 +121,46 @@ class FoundationScheduler:
         return count
 
     def check(self, project_id=None, manual=False):
+        with self._check_lock:
+            return self._check(project_id, manual)
+
+    def _check(self, project_id=None, manual=False):
         projects = [self.store.get("foundation_project", project_id)] if project_id else self.store.list("foundation_project")
         results = []
         for project in projects:
+            claimed = False
             try:
                 project = self._foundation().project(project["id"])
                 interval = project.get("policy", {}).get("checkIntervalSeconds", 300)
-                if self._jobs(project):
+                if self.store.get('foundation_auto_training', project['id'], {}).get('enabled') is True:
+                    interval = min(interval, 30)
+                previous = self.store.get('foundation_scheduler', project['id'], {})
+                if self._jobs(project) or previous.get('state') in PREPARING:
                     interval = min(interval, 5)
                 if not manual and time.monotonic()-self.last_check.get(project["id"], -1e20) < interval:
                     results.append(self.store.get("foundation_scheduler", project["id"], {"projectId": project["id"], "state": "waiting"}))
                     continue
+                # API and isolated worker Controllers share this database but
+                # have different Python locks. Claim a short-lived scheduling
+                # slot before inspecting sources or queueing a prerequisite.
+                with self.store.tx():
+                    slot = self.store.get('foundation_scheduler_claim', project['id'], {})
+                    if slot.get('owner') and slot.get('until', 0) > time.time():
+                        results.append(self.store.get('foundation_scheduler', project['id'],
+                            {'projectId': project['id'], 'state': 'waiting', 'reasonCodes': []}))
+                        continue
+                    self.store.put('foundation_scheduler_claim', {'owner': self._check_owner,
+                        'until': time.time() + 300}, project['id'])
+                    claimed = True
                 self.last_check[project["id"]] = time.monotonic()
                 results.append(self._check_project(project, manual))
             except Fault as exc:
                 results.append(self._status(project, "held", [exc.code]))
+            finally:
+                if claimed:
+                    with self.store.tx():
+                        if self.store.get('foundation_scheduler_claim', project['id'], {}).get('owner') == self._check_owner:
+                            self.store.db.execute("DELETE FROM records WHERE kind='foundation_scheduler_claim' AND id=?", (project['id'],))
         return results[0] if project_id else results
 
     def _refresh(self, project, corpus):
@@ -140,6 +181,75 @@ class FoundationScheduler:
             return self._status(project, "preparing_corpus", [], job=job, sourceSignature=signature)
         return None
 
+    def _prepare_request(self, project):
+        """Consume one explicit Start generation; later user pauses stay paused."""
+        from .autopilot import AutoTraining
+        automatic = self.store.get('foundation_auto_training', project['id'], {})
+        request_id = automatic.get('requestId')
+        if automatic.get('enabled') is not True or not request_id \
+                or automatic.get('preparationState') == 'completed':
+            return
+        if automatic.get('preparationState') == 'failed':
+            error = automatic.get('preparationError') or {}
+            raise Fault(error.get('code', 'AUTOMATIC_PREPARATION_FAILED'), error.get('message'), status=409)
+        helper = AutoTraining(self.control)
+        def current():
+            saved = self.store.get('foundation_auto_training', project['id'], {})
+            policy = self.store.get('foundation_policy', project['id'], {})
+            return saved.get('enabled') is True and saved.get('requestId') == request_id and policy.get('automation') != 'manual'
+        try:
+            if automatic.get('consent') is not None and automatic.get('consentPreparedRequestId') != request_id:
+                if not current():return
+                helper._approve(automatic['consent'])
+                with self.store.tx():
+                    if not current():return
+                    self.store.put('foundation_auto_training', {'consentPreparedRequestId': request_id}, project['id'])
+            if not current():return
+            if self.control.bridge is not None:self.control.bridge.refresh_policy()
+            if not current():return
+            # Reconcile allowed sources before making a paused training job
+            # claimable again. The worker must see the selected policy first.
+            from .autopilot_sources import refresh_project_sources
+            project = refresh_project_sources(self.control, self._foundation().project(project['id']))
+            if not current():return True
+            from .resources import save_recommended_training_config
+            save_recommended_training_config(self.store, self._foundation().project(project['id']), 'pretrain')
+            candidates = automatic.get('resumeCandidates', {})
+            paused_runs = [row for row in helper._paused_runs(project['id'], self._foundation()._pending(project['id']))
+                if row['jobId'] in candidates and row['runVersion'] == candidates[row['jobId']]
+                and row['jobId'] not in automatic.get('resumedJobIds', [])]
+            if paused_runs and (not project['policy'].get('enabled') or not project['policy'].get('allowedSourceIds')):
+                return True
+            for paused in paused_runs:
+                require(paused['resumable'], 'CHECKPOINT_REQUIRED', '이어서 학습할 유효한 체크포인트가 없습니다.', status=409)
+                from .checkpoint import verify
+                try:verify(self.store, paused['checkpoint'])
+                except Fault as exc:
+                    raise Fault(exc.code, '저장된 체크포인트 검증에 실패해 학습을 재개하지 않았습니다.', status=409) from exc
+                except (OSError, ValueError, TypeError) as exc:
+                    raise Fault('CHECKPOINT_INVALID', '저장된 체크포인트를 읽을 수 없어 학습을 재개하지 않았습니다.', status=409) from exc
+                with self.store.tx():
+                    if not current():return
+                    # A user can pause again while a checkpoint is being read.
+                    # Only the exact paused version authorized by Start resumes.
+                    run = self.store.get('foundation_run', paused['jobId'], {})
+                    if run.get('version') != candidates[paused['jobId']]:continue
+                    self._foundation().command(paused['jobId'], 'resume')
+                    requested = self.store.get('foundation_auto_training', project['id'])
+                    self.store.put('foundation_auto_training', {'resumedJobIds':
+                        sorted(set(requested.get('resumedJobIds', [])) | {paused['jobId']})}, project['id'])
+            with self.store.tx():
+                if current():
+                    self.store.put('foundation_auto_training', {'preparationState': 'completed',
+                        'preparationError': None, 'preparedAt': now()}, project['id'])
+            return True
+        except Fault as exc:
+            with self.store.tx():
+                if current():
+                    self.store.put('foundation_auto_training', {'preparationState': 'failed',
+                        'preparationError': {'code': exc.code, 'message': exc.message}}, project['id'])
+            raise
+
     def _check_project(self, project, manual):
         foundation = self._foundation()
         policy = project.get("policy", {})
@@ -149,6 +259,19 @@ class FoundationScheduler:
         mode = policy.get("automation", project.get("automation", "always_on_idle"))
         if project.get("state") == "revoked" or project.get("stage") == "revoked":
             return self._status(project, "revoked", ["POLICY_REVOKED"])
+        automatic = self.store.get('foundation_auto_training', project['id'], {})
+        if automatic.get('enabled') is True:
+            sources_prepared = self._prepare_request(project)
+            project = foundation.project(project['id'])
+            from .autopilot_sources import refresh_project_sources
+            if not sources_prepared:project = refresh_project_sources(self.control, project)
+            policy = project.get('policy', {})
+            mode = policy.get('automation', project.get('automation', 'always_on_idle'))
+            automatic = self.store.get('foundation_auto_training', project['id'], {})
+            if automatic.get('enabled') is True and mode != 'manual' and not policy.get('enabled') \
+                    and not policy.get('allowedSourceIds'):
+                prepared = automatic.get('sourcePreparation', {})
+                return self._status(project, 'waiting_corpus', prepared.get('reasonCodes') or ['INSUFFICIENT_CORPUS'])
         if not manual and (not policy.get("enabled", False) or mode == "manual"):
             self._pause_active(project, "AUTOMATION_DISABLED")
             return self._status(project, "paused", ["AUTOMATION_DISABLED"])
@@ -307,4 +430,21 @@ class FoundationScheduler:
         return self._status(project, "evaluating_release", [], job=result)
 
     def advance(self, project_id=None):
+        # The NAS shared-volume worker executes queued prerequisites, but only
+        # the integrated controller has the RAG bridge needed to schedule them.
+        # Do not let its supervisor acquire a scheduling slot and replace the
+        # controller's real progress with RAG_POLICY_GATEWAY_REQUIRED.
+        offline_worker = (os.environ.get('SEED_FOUNDATION_WORKER') == '1'
+            and getattr(self.control, 'worker_enabled', False)
+            and getattr(self.control, 'execution_scope', 'nas') == 'nas'
+            and getattr(self.control, 'bridge', None) is None)
+        if offline_worker:
+            if project_id is not None:
+                project = self.store.get('foundation_project', project_id)
+                if project.get('testOnly') is not True:
+                    return self.store.get('foundation_scheduler', project_id,
+                        {'projectId': project_id, 'state': 'waiting', 'reasonCodes': []})
+            else:
+                return [self.check(project['id']) for project in self.store.list('foundation_project')
+                        if project.get('testOnly') is True]
         return self.check(project_id)

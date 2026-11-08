@@ -423,10 +423,11 @@ class RagBridge:
         parsed=Tokenizer.from_file(str(tokenizer))
         require(profile.get('templateFormat') in ('chatml','seed-structured-v1'),'GENERATION_PROFILE_INCOMPATIBLE')
         if profile.get('templateFormat')=='chatml':require(parsed.encode('<|im_start|>assistant\n',add_special_tokens=False).ids,'INVALID_TEMPLATE')
+        endpoint=self.c.store.get('setting','inferenceEndpoint',{}).get('url','http://127.0.0.1:8100')
         with self.deployment_lock,self.post.lock,self.store.tx():
             current=self.store.setting('settings',{})
             self.store.set_setting('settings',{**current,'model':release['engineAlias'],'tokenizerPath':str(tokenizer),
-                'endpoint':self.c.store.get('setting','inferenceEndpoint',{}).get('url','http://127.0.0.1:8100'),
+                'endpoint':endpoint,
                 'contextTokens':profile['contextLength'],'maxOutputTokens':profile.get('maxOutputTokens',current.get('maxOutputTokens',700)),
                 'activeReleaseId':release['id'],'version':current.get('version',0)+1})
             self.post.tokenizer_cache=None;self.post.generation_profile=profile;self.post.model_status_cache=None

@@ -16,7 +16,7 @@ export default function FoundationSources({ sources, selectedSources, onSelectio
     } catch (cause) { setError(cause.message); }
   }
   return <div className="foundation-source-setup">
-    <p className="foundation-setup-copy">학습 이용을 승인한 출처만 선택할 수 있습니다. 선택한 자료와 학습 방식은 위의 설정 버튼으로 저장하세요.</p>
+    <p className="foundation-setup-copy">학습 이용을 승인한 출처만 선택할 수 있습니다. 직접 선택한 자료와 학습 방식은 아래 ‘출처 · 방식 저장’으로 저장하세요.</p>
     {sources.length || missing.length ? <div className="foundation-source-options">{sources.map(source => {
       const supported = source.kind !== 'local_directory';
       const allowed = supported && source.trainingPolicy === 'allowed';

@@ -16,13 +16,17 @@ export async function ragRequest(path, { method = 'GET', body, signal, headers =
   const form = typeof FormData !== 'undefined' && body instanceof FormData;
   const timeout = !raw && timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : null;
   const combinedSignal = signal && timeout ? AbortSignal.any([signal, timeout]) : signal ?? timeout ?? undefined;
-  const response = await fetch(path.startsWith('/api/') ? path : `${API_BASE}${path}`, {
+  let response;
+  try { response = await fetch(path.startsWith('/api/') ? path : `${API_BASE}${path}`, {
     method, signal: combinedSignal, credentials: 'same-origin', cache: 'no-store',
     headers: { ...(!form && body !== undefined ? { 'Content-Type': 'application/json' } : {}),
       ...(write && csrfToken ? { 'X-CSRF-Token': csrfToken } : {}),
       ...(write ? { 'Idempotency-Key': idempotencyKey ?? requestId() } : {}), ...headers },
     ...(body === undefined ? {} : { body: form ? body : JSON.stringify(body) }),
-  });
+  }); } catch (cause) {
+    if (cause.name === 'TimeoutError') throw new RagError('서버 응답이 늦어지고 있습니다. 연결 상태를 자동으로 다시 확인합니다.', 'REQUEST_TIMEOUT');
+    throw cause;
+  }
   if (!response.ok) {
     let payload; try { payload = await response.json(); } catch {}
     const error = payload?.error ?? payload?.detail;

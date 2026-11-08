@@ -62,6 +62,35 @@ def atomic_json(path, value):
     os.replace(temp, path)
 
 class Store:
+    @classmethod
+    def open_existing(cls, root, *, read_only=False, busy_timeout_ms=5000):
+        """Attach to an initialized store without running schema writes.
+
+        Deployment inspection and health probes must not compete for the writer
+        lock merely to read a heartbeat. Missing stores are never initialized by
+        this entry point; callers that create or migrate stores use Store().
+        """
+        require(type(read_only) is bool and type(busy_timeout_ms) is int
+                and 0 <= busy_timeout_ms <= 300000, "STORE_OPTIONS_INVALID")
+        require(tuple(map(int, apsw.sqlitelibversion().split("."))) >= (3,51,3), "SQLITE_PATCH_REQUIRED", status=503)
+        value = cls.__new__(cls)
+        value.root = Path(root).resolve()
+        path = value.root / "metadata" / "llm.db"
+        require(path.is_file(), "STORE_NOT_INITIALIZED", status=503)
+        value.lock = threading.RLock()
+        value.db = apsw.Connection(str(path), flags=apsw.SQLITE_OPEN_READONLY if read_only else apsw.SQLITE_OPEN_READWRITE)
+        try:
+            value.db.set_busy_timeout(busy_timeout_ms)
+            # Both pragmas apply to this connection, without changing the
+            # persisted journal mode or running CREATE/INSERT migrations.
+            value.db.execute("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")
+            require(bool(value.rows("SELECT version FROM migrations WHERE version=1")), "STORE_NOT_INITIALIZED", status=503)
+            value.rows("SELECT kind,id,body FROM records LIMIT 0")
+        except BaseException:
+            value.db.close()
+            raise
+        return value
+
     def __init__(self, root):
         self.root = Path(root).resolve()
         for name in ("metadata", "artifacts", "snapshots", "checkpoints", "staging", "backups", "suites", "reports"):

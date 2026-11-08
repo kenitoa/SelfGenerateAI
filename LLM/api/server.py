@@ -106,12 +106,53 @@ def create_app(root,*,token=None,local=False,worker=False,allowed_roots=(),contr
 def foundation_http_response(path,method,result):
     """Apply additive foundation status codes after durable JSON idempotency."""
     if method!='POST' or not path.startswith('foundation/') or not isinstance(result,dict):return result
+    if result.get('accepted') is True and _auto_training_path(path):
+        return JSONResponse(result,status_code=202)
     if str(result.get('type','')).startswith('foundation_') and result.get('state')=='queued':
         return JSONResponse(result,status_code=202)
     if path in ('foundation/projects','foundation/suites','foundation/self-code/suites',
                 'foundation/graduations','foundation/release-candidates'):
         return JSONResponse(result,status_code=201)
     return result
+
+def _auto_training_path(path):
+    bits=path.split('/')
+    return bits==['foundation','auto-training'] or (len(bits)==4 and bits[0:2]==['foundation','projects'] and bits[3]=='auto-training')
+
+def _accept_auto_training(c,path,body,key):
+    """Auto Start is a metadata receipt, atomically durable with idempotency.
+
+    No RAG inspection or model work occurs here. Legacy NULL records can safely
+    become receipts; generic active mutations keep their existing 409 behavior.
+    A replay reads current intent so an earlier Start never undoes a later Stop.
+    """
+    from LLM.core import canonical,digest
+    from LLM.foundation.autopilot import AutoTraining
+    automatic=AutoTraining(c)
+    identity=path+':'+key
+    request_hash=digest(body)
+    project_id=path.split('/')[2] if path.startswith('foundation/projects/') else None
+    with c.store.tx():
+        old=c.store.rows('SELECT request_hash,result FROM idempotency WHERE key=?',(identity,))
+        if old:
+            require(old[0]['request_hash']==request_hash,'IDEMPOTENCY_CONFLICT',status=409)
+            if old[0]['result'] is not None:
+                saved=json.loads(old[0]['result'])
+                return automatic.receipt(saved) if isinstance(saved,dict) and saved.get('projectId') else saved
+        result=None
+        if old:
+            # A pre-receipt deployment may have persisted Start, then lost its
+            # acknowledgement. Reconcile that durable intent first, including
+            # a later Stop, instead of accepting the old click a second time.
+            selected=automatic._project(project_id or (body.get('projectId') if isinstance(body,dict) else None))
+            requested=c.store.get('foundation_auto_training',selected['id'],{}) if selected else {}
+            if requested:
+                result=automatic.receipt({'projectId':selected['id'],'requestId':requested.get('requestId'),
+                    'requestedAt':requested.get('requestedAt')})
+        if result is None:result=automatic.start(project_id,body,key)
+        if old:c.store.db.execute('UPDATE idempotency SET result=? WHERE key=?',(canonical(result),identity))
+        else:c.store.db.execute('INSERT INTO idempotency VALUES(?,?,?)',(identity,request_hash,canonical(result)))
+        return result
 
 def dispatch(c,path,method,body,key=None,expected=None):
     from LLM.core import canonical,digest
@@ -128,6 +169,7 @@ def dispatch(c,path,method,body,key=None,expected=None):
     if expected is not None:require(expected.strip('"').isdigit(),'INVALID_VERSION')
     if method!='POST':return _dispatch(c,path,method,body,key,expected)
     require(key,'IDEMPOTENCY_KEY_REQUIRED')
+    if _auto_training_path(path):return _accept_auto_training(c,path,body,key)
     identity=path+':'+key;request_hash=digest(body)
     with c.store.tx():
         old=c.store.rows('SELECT request_hash,result FROM idempotency WHERE key=?',(identity,))
