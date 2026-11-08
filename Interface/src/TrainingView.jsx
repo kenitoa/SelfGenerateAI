@@ -10,7 +10,7 @@ const activeStates = ['preparing', 'running', 'paused', 'validating'];
 const count = value => value.toLocaleString('ko-KR');
 const timestamp = value => new Date(value).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' });
 
-export default function TrainingView({ settings, config, onConfig, nasRam, onRamChange, onModelSelect }) {
+export default function TrainingView({ settings, config, onConfig, nasRam, onRamChange, onModelSelect, onNavigate }) {
   const { status, connection, lastReceivedAt, error, pending, refresh, command } = useTrainingStatus(globalThis.location?.origin ?? '');
   const { job, runs } = status;
   const connected = connection === 'connected' && (!status.connection || ['connected', 'ready'].includes(status.connection));
@@ -20,7 +20,7 @@ export default function TrainingView({ settings, config, onConfig, nasRam, onRam
   const blocked = !connected || pending;
   const connectionLabel = connected ? '실시간 연결' : connection === 'stale' ? '갱신 중단' : connection === 'connecting' ? '연결 확인 중' : '서버 미연결';
   return <>
-    <FoundationPanel />
+    <FoundationPanel onNavigate={onNavigate} />
     <details className="foundation-legacy"><summary>기존 전문 모델 · LoRA 학습</summary>
     <div className="page-heading" style={{ justifyContent: 'flex-end' }}><button className="button secondary" onClick={onConfig}><SlidersHorizontal size={16} />학습 설정</button></div>
     <div className="info-banner"><CircleHelp size={17} /><span>{connected ? '진행률 = 완료 스텝 ÷ 전체 스텝 · 서버 응답 기준' : connection === 'stale' ? '연결 끊김 · 마지막 수신값 유지 · 진행률 갱신 중단' : '학습 서버 연결 전 · 실행 및 진행률 측정 불가'}</span></div>

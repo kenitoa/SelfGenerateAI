@@ -39,9 +39,8 @@ def machine_fingerprint():
 
 def isolated_network():
     """Offline library flags do not count as OS network isolation."""
-    path = Path('/sys/class/net')
-    try:return path.is_dir() and set(p.name for p in path.iterdir()) <= {'lo'}
-    except OSError:return False
+    from LLM.verification.network import evidence
+    return evidence()['isolated']
 
 
 def foundation_budget(store, *, test_only=False):

@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Activity, ArrowRight, Check, Clock3, Cpu, Database, FlaskConical, Layers3, Loader2, Pause, Play, Plus, RefreshCw, ShieldCheck, Sprout, Square } from 'lucide-react';
+import { Activity, ArrowRight, Check, Clock3, Cpu, Database, FlaskConical, Layers3, Loader2, Pause, Play, Plus, RefreshCw, Sprout, Square } from 'lucide-react';
 import { ragRequest } from './rag-api';
 import { actualNumber, collection, foundationProgress, foundationRequest, reasonLabel, stageLabel } from './foundation-api';
 import './FoundationPanel.css';
+import FoundationSources from './FoundationSources';
+import { trainingSetup } from './foundation-setup';
 
 const stages = [['자료', Database], ['토큰', Layers3], ['초기화', Sprout], ['학습', Activity], ['검증', FlaskConical], ['사용', Check]];
 const stageIndex = value => {
@@ -67,7 +69,7 @@ function AcceptanceSummary({ value, failed, loading, refresh }) {
   </aside>;
 }
 
-export default function FoundationPanel() {
+export default function FoundationPanel({ onNavigate }) {
   const [projects, setProjects] = useState([]), [projectId, setProjectId] = useState(''), [project, setProject] = useState(null);
   const [sources, setSources] = useState([]), [selectedSources, setSelectedSources] = useState([]);
   const [run, setRun] = useState(null), [mode, setMode] = useState('always_on_idle');
@@ -75,6 +77,8 @@ export default function FoundationPanel() {
   const [connected, setConnected] = useState(false), [stale, setStale] = useState(false), [observedAt, setObservedAt] = useState(null);
   const [advanced, setAdvanced] = useState(false), [name, setName] = useState('SEED-S0');
   const [sourceError, setSourceError] = useState('');
+  const [sourceLoading, setSourceLoading] = useState(true), [showSources, setShowSources] = useState(false);
+  const sourceSection = useRef(null);
   const [policyVersion, setPolicyVersion] = useState(null);
   const [corpusKind, setCorpusKind] = useState('raw'), [snapshots, setSnapshots] = useState([]), [snapshotId, setSnapshotId] = useState('');
   const [profiles, setProfiles] = useState([]);
@@ -137,20 +141,53 @@ export default function FoundationPanel() {
     poll();
     return () => { disposed = true; clearTimeout(timer); mounted.current = false; };
   }, [load]);
-  useEffect(() => {
-    const controller = new AbortController();
-    ragRequest('/sources', { signal: controller.signal }).then(result => setSources(collection(result))).catch(cause => {
-      if (cause.name !== 'AbortError') setSourceError(cause.message);
-    });
-    return () => controller.abort();
+  const refreshSources = useCallback(async signal => {
+    try {
+      const result = await ragRequest('/sources', { signal });
+      if (mounted.current) { setSources(collection(result)); setSourceError(''); }
+    } catch (cause) {
+      if (cause.name !== 'AbortError' && mounted.current) setSourceError(cause.message);
+    } finally { if (mounted.current && !signal?.aborted) setSourceLoading(false); }
   }, []);
+  useEffect(() => {
+    const controller = new AbortController(); let timer;
+    const poll = async () => { await refreshSources(controller.signal); if (!controller.signal.aborted) timer = setTimeout(poll, 5000); };
+    poll();
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [refreshSources]);
+  useEffect(() => {
+    if (showSources) {
+      sourceSection.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      sourceSection.current?.focus({ preventScroll: true });
+    }
+  }, [showSources]);
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(''), 6000);
+    return () => clearTimeout(timer);
+  }, [notice]);
+
+  function openSources() {
+    setShowSources(true);
+    sourceSection.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    sourceSection.current?.focus({ preventScroll: true });
+  }
+  async function approveSource(source, body) {
+    if (busy) return;
+    setBusy(true); setError('');
+    try {
+      await ragRequest(`/sources/${encodeURIComponent(source.id)}`, { method: 'PATCH', body: { ...body, trainingPolicy: 'allowed' } });
+      setSources(previous => previous.map(item => item.id === source.id ? { ...item, ...body, trainingPolicy: 'allowed' } : item));
+      setNotice('학습 이용을 허용했습니다. 사용할 자료를 체크해 주세요.');
+    } finally { if (mounted.current) setBusy(false); }
+  }
 
   async function mutate(path, body = {}, options = {}) {
     if (busy) return null;
     setBusy(true); setError(''); setNotice('');
     try {
       const result = await foundationRequest(path, { method: 'POST', body, ...options });
-      setNotice('요청 접수 · 서버 상태 확인 중');
+      setNotice('요청을 접수했습니다. 실행 상태는 아래에 표시됩니다.');
       await load(); return result;
     } catch (cause) { setError(cause.message); return null; }
     finally { if (mounted.current) setBusy(false); }
@@ -159,7 +196,7 @@ export default function FoundationPanel() {
     event.preventDefault();
     const result = await mutate('projects', { name: name.trim(), origin: 'random_init', architecturePreset: 'seed-s0-11m-v1',
       pretrainedWeightArtifactIds: [], policyId: 'foundation-local-v1', automation: mode });
-    if (result?.id) { lastProject.current = null; setProjectId(result.id); }
+    if (result?.id) { lastProject.current = null; setProjectId(result.id); setNotice('프로젝트를 만들었습니다. 이제 학습할 자료를 준비해 주세요.'); }
   }
   async function savePolicy(enabled = project?.policy?.enabled ?? false) {
     if (!project) return;
@@ -169,8 +206,9 @@ export default function FoundationPanel() {
       sliceSeconds: 900, dailyActiveSeconds: 14400 }, { method: 'PATCH', headers: { 'If-Match': String(version) } });
     if (result) {
       setPolicyVersion(result.policy?.version ?? result.version ?? version + 1);
-      setNotice(enabled ? '자동화 설정 저장 · 실행 조건 확인 중' : '설정 저장 · 자동 실행 중지');
+      setNotice(enabled && mode !== 'manual' ? '자동 학습 설정을 저장했습니다. 실행 조건에 따라 순서대로 진행합니다.' : mode === 'manual' ? '수동 설정을 저장했습니다. 단계별 제어에서 실행해 주세요.' : '설정을 저장하고 자동 학습을 껐습니다.');
     }
+    return result;
   }
   const rawCorpus = entity({ corpora: collection(project?.corpora).filter(item => item.purpose !== 'sft' && item.corpusKind !== 'sft') }, 'corpora', project?.activeCorpusId);
   const approvedCorpus = entity({ corpora: collection(project?.corpora).filter(item => item.purpose === 'sft' || item.corpusKind === 'sft') }, 'corpora', project?.activeSftCorpusId);
@@ -185,7 +223,18 @@ export default function FoundationPanel() {
   const reasons = [...new Set([...(project?.reasonCodes ?? []), ...(project?.readiness?.reasonCodes ?? []), ...(run?.reasonCodes ?? [])])];
   const usable = phase === 'usable' && (project?.capabilityFlags?.generation === true || project?.capabilityFlags?.canServe === true);
   const disabled = busy || stale || !connected;
-  const approvedSources = sources.filter(source => source.trainingPolicy === 'allowed' && source.kind !== 'local_directory');
+  const setup = trainingSetup({ connected, stale, loading, sourceLoading, sourceError, sources, selectedSources, mode,
+    enabled: project?.policy?.enabled, running });
+  const startBlocked = disabled || sourceLoading || Boolean(sourceError) || setup.action !== 'save';
+  async function setupAction() {
+    if (setup.action === 'refresh') { load(); refreshSources(); }
+    else if (setup.action === 'data') onNavigate('data');
+    else if (setup.action === 'sources') openSources();
+    else if (setup.action === 'save') {
+      const saved = await savePolicy(true);
+      if (saved && mode === 'manual') setAdvanced(true);
+    }
+  }
   const policyChanged = JSON.stringify([...(project?.policy?.allowedSourceIds ?? [])].sort()) !== JSON.stringify([...selectedSources].sort())
     || policyMode(project?.policy?.automation) !== mode;
   const createCorpus = () => mutate(`projects/${project.id}/corpora`, { allowedSourceIds: selectedSources,
@@ -218,19 +267,26 @@ export default function FoundationPanel() {
     {!project ? <div className="foundation-empty"><span><Sprout size={35} strokeWidth={1.3} /></span><h3>첫 번째 시작</h3><p>토큰 학습 · 무작위 초기화 · 전체 가중치 학습</p><form onSubmit={createProject}><label className="field"><span>모델 이름</span><input aria-label="자체 모델 이름" maxLength={50} required value={name} onChange={event => setName(event.target.value)} /></label><button className="button primary" disabled={disabled || !name.trim()} type="submit">{busy ? <Loader2 size={15} className="spin" /> : <Plus size={15} />}프로젝트 만들기</button></form><small>초기화는 사용 가능 판정과 다릅니다.</small></div>
       : <>
         <div className="foundation-project-heading"><label><span className="sr-only">자체 모델 프로젝트</span><select value={projectId} onChange={event => { setProject(null); setRun(null); setProjectId(event.target.value); }} disabled={busy}>{projects.map(item => <option key={item.id} value={item.id}>{item.name ?? item.id}</option>)}</select></label><span>{usable ? `${scope.length ? scope.join(' · ') : '승인 범위'} · 사용 가능` : '일반 생성 잠금 · 독립 검증 필요'}</span></div>
+        <section className="foundation-start" aria-label="학습 준비와 시작">
+          <div className="foundation-start-heading"><span className="foundation-start-icon"><Sprout size={22} /></span><div><h3>{setup.title}</h3><p>{setup.description}</p></div></div>
+          <div className="foundation-setup-counts"><span>등록 <strong>{sources.length}개</strong></span><span>학습 허용 <strong>{sources.filter(source => source.trainingPolicy === 'allowed' && source.kind !== 'local_directory').length}개</strong></span><span>선택 <strong>{selectedSources.length}개</strong></span></div>
+        <div className="foundation-policy-row"><span><Clock3 size={15} />학습 방식</span><div className="foundation-mode-picker" role="group" aria-label="자가학습 방식">{[['always_on_idle', '유휴 시간 자동'], ['night_window', '야간 자동'], ['manual', '수동']].map(([value, label]) => <button type="button" key={value} aria-pressed={mode === value} className={mode === value ? 'selected' : ''} disabled={disabled} onClick={() => setMode(value)}>{label}</button>)}</div><span className="foundation-policy-hint">{mode === 'night_window' ? '02:00–06:00' : mode === 'manual' ? '요청한 학습만' : '작업 우선 · 여유 자원'} · 하루 4시간</span></div>
+          <div className="foundation-controls"><button className="button primary" type="button" disabled={busy || setup.action === 'wait'} onClick={setupAction}>{busy || setup.action === 'wait' ? <Loader2 size={15} className="spin" /> : setup.action === 'save' ? <Play size={15} /> : <ArrowRight size={15} />}{busy ? '설정 처리 중' : setup.label}</button><button className="button secondary" type="button" disabled={busy} aria-expanded={showSources} onClick={() => showSources ? setShowSources(false) : openSources()}><Database size={14} />학습 자료 관리</button></div>
+          {project.policy?.enabled && <p className="foundation-start-status" role="status">{running ? '학습 작업 진행 중' : '현재 상태: ' + stageLabel(phase)}{reasons.length > 0 && ' · ' + reasons.map(reasonLabel).join(' · ')}</p>}
+        </section>
+        <section className="foundation-source-section" ref={sourceSection} tabIndex={-1} aria-label="학습 자료 설정" hidden={!showSources}>
+          <div className="foundation-source-heading"><h3>학습할 자료 선택</h3><button className="text-button" type="button" disabled={busy || sourceLoading} onClick={() => refreshSources()}><RefreshCw size={13} />목록 새로고침</button></div>
+          {sourceError && <p className="foundation-feedback error" role="alert">{sourceError}</p>}
+          {sourceLoading ? <p className="foundation-setup-copy">자료 목록 확인 중…</p> : <FoundationSources sources={sources} selectedSources={selectedSources} onSelection={setSelectedSources} disabled={disabled || Boolean(sourceError)} onApprove={approveSource} onAddData={() => onNavigate('data')} />}
+        </section>
         <div className="foundation-metrics">{[
           ['학습 토큰', number(metrics.completed), 'target tokens'], ['완료 스텝', number(metrics.steps), 'optimizer steps'],
           ['Loss', number(metrics.loss, 5), '실제 관측'], ['처리량', number(metrics.tokensPerSecond, 2), 'tokens / sec'],
         ].map(([label, value, unit]) => <div key={label}><span>{label}</span><strong>{value}</strong><small>{unit}</small></div>)}</div>
-        <AcceptanceSummary value={acceptance} failed={acceptanceError} loading={acceptanceLoading} refresh={() => refreshAcceptance()} />
         {run && <div className="foundation-run-progress"><div><span>{stageLabel(run.phase ?? run.state)}</span><strong>{metrics.percent === null ? '분모 대기' : `${metrics.percent}%`}</strong></div><div className="progress-track" role="progressbar" aria-label="실제 학습 노출 토큰 진행률" aria-valuemin={0} aria-valuemax={100} aria-valuenow={metrics.percent ?? undefined}><i style={{ width: `${metrics.percent ?? 0}%` }} /></div><small>{number(metrics.completed)} / {number(metrics.total)} target tokens · 사용 가능 여부는 별도 검증</small></div>}
         {reasons.length > 0 && <div className="foundation-blockers">{reasons.map(reason => <span key={reason} title={reason}>{reasonLabel(reason)}</span>)}</div>}
-        <div className="foundation-controls"><button className="button primary" type="button" disabled={disabled || !selectedSources.length} onClick={() => savePolicy(true)}>{busy ? <Loader2 size={15} className="spin" /> : <Play size={15} />}{mode === 'manual' ? '수동 설정' : project.policy?.enabled ? '자동화 갱신' : '자가학습 시작'}</button>{!selectedSources.length && <button className="button secondary" type="button" onClick={() => setAdvanced(true)}><Database size={14} />출처 선택</button>}{project.policy?.enabled && <button className="button secondary" type="button" disabled={disabled} onClick={() => savePolicy(false)}><Square size={14} />자동화 중지</button>}{run && <>{runState === 'paused' ? <button className="button secondary" type="button" disabled={disabled || run.capabilities?.resume !== true} onClick={() => mutate(`runs/${run.id}/resume`)}><Play size={14} />재개</button> : running && <button className="button secondary" type="button" disabled={disabled || run.capabilities?.pause !== true} onClick={() => mutate(`runs/${run.id}/pause`)}><Pause size={14} />일시정지</button>}{(running || runState === 'paused') && <button className="button secondary" type="button" disabled={disabled || run.capabilities?.cancel !== true} onClick={() => mutate(`runs/${run.id}/cancel`)}>학습 중지</button>}</>}</div>
-        <div className="foundation-policy-row"><span><Clock3 size={15} />학습 방식</span><div className="foundation-mode-picker" role="group" aria-label="자가학습 방식">{[['always_on_idle', '유휴'], ['night_window', '야간'], ['manual', '수동']].map(([value, label]) => <button type="button" key={value} aria-pressed={mode === value} className={mode === value ? 'selected' : ''} disabled={disabled} onClick={() => setMode(value)}>{label}</button>)}</div><span className="foundation-policy-hint">{mode === 'night_window' ? '02:00–06:00' : mode === 'manual' ? '요청한 학습만' : '작업 우선 · 여유 자원'} · 하루 4시간</span></div>
-        <details className="foundation-details" open={advanced} onToggle={event => setAdvanced(event.currentTarget.open)}><summary>출처 · 단계별 제어 <span>고급</span></summary><div className="foundation-detail-content"><div className="foundation-source-heading"><h3>학습 출처</h3><span><ShieldCheck size={13} />학습 허용 자료만</span></div>{sourceError && <p className="foundation-feedback error">{sourceError}</p>}{sources.length ? <div className="foundation-source-list">{sources.map(source => {
-          const allowed = approvedSources.some(item => item.id === source.id);
-          return <label className={!allowed ? 'unapproved' : ''} key={source.id}><input type="checkbox" checked={selectedSources.includes(source.id)} disabled={disabled || !allowed} onChange={event => setSelectedSources(previous => event.target.checked ? [...new Set([...previous, source.id])] : previous.filter(id => id !== source.id))} /><span><strong>{source.name}</strong><small>{source.kind === 'upload' ? '업로드 원문' : source.kind}</small></span><span className={`status-pill ${allowed ? 'ready' : 'pending'}`}>{allowed ? '학습 허용' : '미승인'}</span></label>;
-        })}</div> : <p className="foundation-source-empty">데이터에서 원문 추가 후, 설정에서 학습 이용을 승인하세요.</p>}<button className="button secondary" type="button" disabled={disabled || !policyChanged} onClick={() => savePolicy()}><Check size={14} />출처 · 방식 저장</button><div className="foundation-corpus-type"><label className="field"><span>학습 자료</span><select value={corpusKind} onChange={event => setCorpusKind(event.target.value)} disabled={disabled}><option value="raw">원문 · 기초학습 / CPT</option><option value="sft">승인 응답 · SFT</option></select></label>{corpusKind === 'sft' && <label className="field"><span>승인 스냅샷</span><select value={snapshotId} onChange={event => setSnapshotId(event.target.value)} disabled={disabled}><option value="">스냅샷 선택</option>{snapshots.filter(item => item.status === 'ready').map(item => <option key={item.id} value={item.id}>{item.name ?? item.id} · {item.exampleCount ?? '—'}개</option>)}</select></label>}</div><div className="foundation-stage-actions">
+        <div className="foundation-controls">{project.policy?.enabled && <button className="button secondary" type="button" disabled={disabled} onClick={() => savePolicy(false)}><Square size={14} />자동화 중지</button>}{run && <>{runState === 'paused' ? <button className="button secondary" type="button" disabled={disabled || run.capabilities?.resume !== true} onClick={() => mutate(`runs/${run.id}/resume`)}><Play size={14} />재개</button> : running && <button className="button secondary" type="button" disabled={disabled || run.capabilities?.pause !== true} onClick={() => mutate(`runs/${run.id}/pause`)}><Pause size={14} />일시정지</button>}{(running || runState === 'paused') && <button className="button secondary" type="button" disabled={disabled || run.capabilities?.cancel !== true} onClick={() => mutate(`runs/${run.id}/cancel`)}>학습 중지</button>}</>}</div>
+        <details className="foundation-details" open={advanced} onToggle={event => setAdvanced(event.currentTarget.open)}><summary>단계별 수동 제어 · 상세 정보 <span>고급</span></summary><div className="foundation-detail-content"><p className="foundation-setup-copy">수동 실행 순서: 자료 검사 → 토큰 학습 → 초기화 → 실측 → 기초학습. 자동 모드에서는 위에서 자동 학습을 켜면 순서대로 진행합니다.</p><button className="button secondary" type="button" disabled={startBlocked || !policyChanged} onClick={() => savePolicy()}><Check size={14} />출처 · 방식 저장</button><div className="foundation-corpus-type"><label className="field"><span>학습 자료</span><select value={corpusKind} onChange={event => setCorpusKind(event.target.value)} disabled={disabled}><option value="raw">원문 · 기초학습 / CPT</option><option value="sft">승인 응답 · SFT</option></select></label>{corpusKind === 'sft' && <label className="field"><span>승인 스냅샷</span><select value={snapshotId} onChange={event => setSnapshotId(event.target.value)} disabled={disabled}><option value="">스냅샷 선택</option>{snapshots.filter(item => item.status === 'ready').map(item => <option key={item.id} value={item.id}>{item.name ?? item.id} · {item.exampleCount ?? '—'}개</option>)}</select></label>}</div><div className="foundation-stage-actions">
           <button type="button" disabled={disabled || !selectedSources.length || policyChanged || (corpusKind === 'sft' && !snapshotId)} onClick={createCorpus}><Database size={15} />자료 검사</button>
           <button type="button" disabled={disabled || !valid(corpus) || sftCorpus || Boolean(project.genesisId)} onClick={createTokenizer}><Layers3 size={15} />토큰 학습</button>
           <button type="button" disabled={disabled || !valid(tokenizer) || Boolean(project.genesisId)} onClick={initialize}><Sprout size={15} />초기화</button>
@@ -241,6 +297,7 @@ export default function FoundationPanel() {
           <button type="button" disabled={disabled || !checkpointId || !metrics.steps} onClick={evaluate}><FlaskConical size={15} />기초 검증</button>
           <button type="button" disabled={disabled || !qualification} onClick={() => mutate('graduations', { projectId: project.id, checkpointId, evaluationId: qualification.id })}><Check size={15} />기초 자격</button>
         </div><div className="foundation-calibration"><div className="foundation-source-heading"><h3>실측 프로파일</h3><span className={`status-pill ${measuredProfile?.passed === true ? 'ready' : 'pending'}`}>{measuredProfile ? measuredProfile.passed ? '실측 통과' : '측정 불충분' : '실측 대기'}</span></div><p>동일 학습 설정의 실측을 통과한 후 학습합니다. 시험 가중치는 보존하지 않습니다.</p><CalibrationScope profile={measuredProfile} /><dl className="foundation-facts"><div><dt>처리량</dt><dd>{number(measuredProfile?.effectiveTokensPerSecond, 2)} tokens/s</dd></div><div><dt>최대 RSS</dt><dd>{actualNumber(measuredProfile?.peakRssBytes) === null ? '미측정' : `${number(measuredProfile.peakRssBytes / 1024 ** 2, 1)} MiB`}</dd></div><div><dt>저장 시간</dt><dd>{number(measuredProfile?.checkpointSeconds, 2)}초</dd></div><div><dt>관측 스텝</dt><dd>{number(measuredProfile?.measuredSteps)} · 워밍업 제외</dd></div><div><dt>Sequence / batch</dt><dd>{number(measuredProfile?.config?.sequenceLength)} / {number(measuredProfile?.config?.microBatchSize)}</dd></div><div><dt>학습 실적</dt><dd>0 · 실측 전용</dd></div></dl>{measuredProfile?.reasonCodes?.length > 0 && <div className="foundation-blockers">{measuredProfile.reasonCodes.map(reason => <span key={reason}>{reasonLabel(reason)}</span>)}</div>}</div><ProjectFacts project={project} metrics={metrics} /></div></details>
+        <details className="foundation-verification"><summary>모델 사용 전 검증 <span>23개 조건 · 상세 보기</span></summary><p className="foundation-setup-copy">학습 결과를 실제 서비스에 사용하기 위한 검증 현황입니다. 지금 해야 할 학습 준비는 위에서 확인하세요.</p><AcceptanceSummary value={acceptance} failed={acceptanceError} loading={acceptanceLoading} refresh={() => refreshAcceptance()} /></details>
         {observedAt && <div className="foundation-observed"><Cpu size={13} /><span>서버 실제 상태</span><time>{new Date(observedAt).toLocaleTimeString('ko-KR', { timeZone: 'Asia/Seoul' })}</time></div>}
       </>}
   </section>;
